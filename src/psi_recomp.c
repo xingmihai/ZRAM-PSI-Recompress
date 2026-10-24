@@ -104,6 +104,11 @@ int main(int argc, char **argv)
     signal(SIGINT,  on_sig);
     signal(SIGHUP,  SIG_IGN);
 
+    /* 自行脱离会话/进程组：父进程(service.sh)退出或被 ksud 清理时不受牵连 */
+    if (setsid() < 0 && errno != EPERM) {
+        /* 已是进程组组长时 setsid 会失败，可忽略 */
+    }
+
     plog("=== psi_recomp start (pid=%d, thresh=%d/%d, hyst=%ds) ===",
          getpid(), THRESH_NORMAL, THRESH_AFTER, HYSTERESIS_SEC);
 
