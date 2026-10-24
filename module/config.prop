@@ -1,0 +1,7 @@
+# 算法名
+# lz4 zstd lzo lzo-rle lz4k lz4hc lz4kd 842 zstdn
+ZRAM_ALGO=lz4kd
+
+# ZRAM字节数
+# 8589934592(8G) 12884901888(12G) 17179869184(16G) 25769803776(24G)
+ZRAM_SIZE=8589934592
