@@ -37,11 +37,26 @@
 
 /* ---------------- 可调参数 ---------------- */
 #define THRESH_NORMAL   40000   /* 常态触发阈值（huge 页数） */
-#define THRESH_AFTER    52000   /* 刚压完时的滞回阈值 */
-#define HYSTERESIS_SEC  1800    /* 滞回持续时间：30 分钟 */
 #define IDLE_TIMEOUT_MS (1800 * 1000)  /* 兜底：无事件时最多等 30 分钟 */
 #define MIN_GAP_SEC     60      /* 两次检查最小间隔，防 PSI 风暴 */
 #define PSI_TRIGGER     "some 15000 1000000"  /* 1s 窗口内 stall > 15ms 触发 */
+
+/*
+ * 滞回：刚压完的一段时间内提高门槛，避免啃残留硬骨头。
+ *
+ * 注意：HYSTERESIS_SEC 必须显著大于 IDLE_TIMEOUT_MS/1000。
+ * 二者相等时，下一次检查恰好落在窗口边界上（实测 dt=1800~1802s），
+ * (dt < HYSTERESIS_SEC) 恒为 false，滞回从不生效 —— 这是 v1.0.3 的实际表现。
+ */
+#define HYSTERESIS_SEC  5400    /* 滞回持续 90 分钟 = 3 个检查周期 */
+
+/*
+ * 滞回门槛不再用固定值，而是「上次压缩后的残留 + 余量」。
+ * 原因：实测压缩后残留会从 31839 一路涨到 55269（地板抬升 74%），
+ * 固定的 52000 很快就被地板超过，形同虚设。
+ * 以残留为基准才能真正表达「等新料攒够再压」。
+ */
+#define HYST_MARGIN     8000    /* 残留之上再新增这么多页才值得再压 */
 
 static volatile sig_atomic_t g_running = 1;
 static FILE *g_log = NULL;
@@ -95,6 +110,20 @@ static int do_recompress(void)
     return 0;
 }
 
+/* 用全新 fd 武装 PSI 触发器；失败返回 -1（errno 有效） */
+static int psi_arm(void)
+{
+    int fd = open(PSI_PATH, O_RDWR | O_CLOEXEC);
+    if (fd < 0) return -1;
+    if (write(fd, PSI_TRIGGER, strlen(PSI_TRIGGER)) < 0) {
+        int e = errno;
+        close(fd);
+        errno = e;
+        return -1;
+    }
+    return fd;
+}
+
 int main(int argc, char **argv)
 {
     const char *logpath = (argc > 1) ? argv[1] : "/dev/null";
@@ -109,58 +138,62 @@ int main(int argc, char **argv)
         /* 已是进程组组长时 setsid 会失败，可忽略 */
     }
 
-    plog("=== psi_recomp start (pid=%d, thresh=%d/%d, hyst=%ds) ===",
-         getpid(), THRESH_NORMAL, THRESH_AFTER, HYSTERESIS_SEC);
-
-    int psi = open(PSI_PATH, O_RDWR | O_CLOEXEC);
-    int psi_ok = 0;
-    if (psi >= 0) {
-        if (write(psi, PSI_TRIGGER, strlen(PSI_TRIGGER)) >= 0) {
-            psi_ok = 1;
-            plog("PSI armed: %s", PSI_TRIGGER);
-        } else {
-            plog("PSI trigger write failed: %s -> fallback to timer", strerror(errno));
-        }
-    } else {
-        plog("PSI open failed (%s) -> fallback to timer", strerror(errno));
-    }
+    plog("=== psi_recomp start (pid=%d, thresh=%ld, hyst=%ds/+%ld) ===",
+         getpid(), THRESH_NORMAL, HYSTERESIS_SEC, HYST_MARGIN);
 
     time_t last_check = 0;
     time_t last_comp  = 0;
+    long last_residual = 0;
     long peak = 0;
     unsigned long n_check = 0, n_comp = 0, n_psi = 0;
 
+    /* 先探测一次：PSI 是否可用，不可用则全程走定时 */
+    int psi_ok = 0;
+    {
+        int probe = psi_arm();
+        if (probe >= 0) {
+            psi_ok = 1;
+            plog("PSI armed: %s", PSI_TRIGGER);
+            close(probe);
+        } else {
+            plog("PSI unavailable (%s) -> fallback to timer", strerror(errno));
+        }
+    }
+
     while (g_running) {
         int fired = 0;
+        int psi = -1;
 
         if (psi_ok) {
-            struct pollfd pfd;
-            pfd.fd = psi;
-            pfd.events = POLLPRI;
-            pfd.revents = 0;
-
-            int r = poll(&pfd, 1, IDLE_TIMEOUT_MS);
-            if (r < 0) {
-                if (errno == EINTR) continue;
-                plog("poll error: %s -> fallback to timer", strerror(errno));
+            /*
+             * 每轮都用全新 fd 武装：PSI 触发是边沿触发且绑定到 fd，
+             * 在旧 fd 上直接 write 重设会返回 EBUSY（实测 v1.0.3 表现），
+             * 换 fd 可彻底避开残留状态。
+             */
+            psi = psi_arm();
+            if (psi < 0) {
+                plog("PSI arm failed (%s) -> fallback to timer", strerror(errno));
                 psi_ok = 0;
-            } else if (r > 0) {
-                fired = 1;
-                n_psi++;
-                /* 读走事件内容，然后重新 arm（PSI 为边沿触发） */
-                char buf[256];
-                lseek(psi, 0, SEEK_SET);
-                ssize_t n = read(psi, buf, sizeof(buf) - 1);
-                if (n > 0) buf[n] = '\0';
-                lseek(psi, 0, SEEK_SET);
-                if (write(psi, PSI_TRIGGER, strlen(PSI_TRIGGER)) < 0) {
-                    plog("re-arm failed: %s -> fallback to timer", strerror(errno));
+            } else {
+                struct pollfd pfd;
+                pfd.fd = psi;
+                pfd.events = POLLPRI;
+                pfd.revents = 0;
+
+                int r = poll(&pfd, 1, IDLE_TIMEOUT_MS);
+                if (r < 0) {
+                    if (errno == EINTR) { close(psi); continue; }
+                    plog("poll error: %s -> fallback to timer", strerror(errno));
                     psi_ok = 0;
+                } else if (r > 0) {
+                    fired = 1;
+                    n_psi++;
                 }
             }
-        } else {
-            sleep(IDLE_TIMEOUT_MS / 1000);
         }
+
+        if (psi_ok && psi >= 0) { close(psi); psi = -1; }
+        if (!psi_ok && !fired) sleep(IDLE_TIMEOUT_MS / 1000);
 
         time_t now = time(NULL);
         /* 限流：PSI 可能高频触发，两次实际检查至少间隔 MIN_GAP_SEC */
@@ -175,9 +208,17 @@ int main(int argc, char **argv)
         }
         if (huge > peak) peak = huge;
 
-        /* 滞回：刚压完的一段时间内提高门槛，避免啃残留硬骨头 */
+        /*
+         * 滞回：刚压完的一段时间内提高门槛，避免啃残留硬骨头。
+         * 门槛 = 上次压缩后的残留 + HYST_MARGIN，而非固定值 ——
+         * 实测残留会从 31839 涨到 55269，固定值很快被地板淹没。
+         */
         int in_hyst = (last_comp != 0) && ((now - last_comp) < HYSTERESIS_SEC);
-        long th = in_hyst ? THRESH_AFTER : THRESH_NORMAL;
+        long th = THRESH_NORMAL;
+        if (in_hyst && last_residual > 0) {
+            long cand = last_residual + HYST_MARGIN;
+            if (cand > th) th = cand;
+        }
 
         if (huge > th) {
             plog("evt=%s huge=%ld > %ld%s -> recompress",
@@ -188,6 +229,7 @@ int main(int argc, char **argv)
                      huge, after, huge - after,
                      huge > 0 ? (double)(huge - after) / huge * 100 : 0.0);
                 last_comp = now;
+                if (after > 0) last_residual = after;
                 n_comp++;
             } else {
                 plog("  recompress FAILED: %s", strerror(errno));
@@ -201,6 +243,6 @@ int main(int argc, char **argv)
     plog("=== exit: checks=%lu psi_events=%lu recompress=%lu peak=%ld ===",
          n_check, n_psi, n_comp, peak);
     if (g_log) fclose(g_log);
-    if (psi >= 0) close(psi);
+    /* psi fd 每轮在循环内关闭，此处无需处理 */
     return 0;
 }
