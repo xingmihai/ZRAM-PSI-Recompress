@@ -61,19 +61,35 @@ cat /sys/block/zram0/comp_algorithm >> "$LOG" 2>&1
 # 优先使用 PSI 事件驱动 helper（空闲零唤醒、突发秒级响应、带滞回）
 # helper 内部已含定时兜底：PSI 不可用时自动降级为 1800 秒轮询
 # 若 helper 缺失或启动失败，则退回纯 shell 定时循环，保证功能不丢
-if [ -x "$MODDIR/psi_recomp" ]; then
-  echo "starting psi_recomp daemon" >> "$LOG"
-  "$MODDIR/psi_recomp" "$MODDIR/psi.log" &
-  DAEMON_PID=$!
+#
+# 注意：zip 打包/下载/解压链路会丢失可执行位（实测刷入后全部变成 644），
+# 故此处先自行 chmod，不能只依赖 [ -x ] 判定，否则会静默回退到 shell 循环
+if [ -f "$MODDIR/psi_recomp" ]; then
+  chmod 0755 "$MODDIR/psi_recomp" 2>/dev/null
+  echo "starting psi_recomp daemon (mode=$(stat -c '%a' "$MODDIR/psi_recomp" 2>/dev/null))" >> "$LOG"
+  # setsid 脱离会话/进程组，避免 ksud 清理时把守护连坐杀掉
+  # 注意：setsid 可能 fork，$! 未必是守护真实 PID，
+  # 故不以 kill -0 判活，改用「日志是否出现 start」判定，更可靠
+  : > "$MODDIR/psi.log"
+  setsid "$MODDIR/psi_recomp" "$MODDIR/psi.log" &
   sleep 3
-  if kill -0 "$DAEMON_PID" 2>/dev/null; then
-    echo "psi_recomp running (pid=$DAEMON_PID)" >> "$LOG"
-    exit 0
+  if grep -q "psi_recomp start" "$MODDIR/psi.log" 2>/dev/null; then
+    echo "psi_recomp running: $(head -1 "$MODDIR/psi.log")" >> "$LOG"
+    DAEMON_PID=1
+  else
+    echo "psi_recomp no start marker, wait for fallback" >> "$LOG"
+    echo "  psi.log: $(cat "$MODDIR/psi.log" 2>/dev/null)" >> "$LOG"
+    DAEMON_PID=""
   fi
-  echo "psi_recomp died, fallback to shell loop" >> "$LOG"
 fi
 
 # 兜底：纯 shell 定时循环（无 PSI、无滞回，行为保守但可靠）
+# helper 已运行时不再启动，避免两套逻辑同时重压缩
+if [ -n "$DAEMON_PID" ]; then
+  echo "psi mode active, shell loop skipped" >> "$LOG"
+  exit 0
+fi
+
 (
 RLOG="$MODDIR/recompress.log"
 ST="$MODDIR/status"
