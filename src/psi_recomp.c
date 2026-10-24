@@ -58,8 +58,25 @@
  */
 #define HYST_MARGIN     8000    /* 残留之上再新增这么多页才值得再压 */
 
+/*
+ * 日志轮转：
+ * 实测 PSI 模式下约 631 行/天（其中 85% 是 skip 行），
+ * 若不轮转会无限增长，最终占满 /data/adb/modules 所在分区。
+ * 超过 LOG_MAX_LINES 时保留最近 LOG_KEEP_LINES 行。
+ */
+#define LOG_MAX_LINES   600     /* 超过此行数触发轮转 */
+#define LOG_KEEP_LINES  300     /* 轮转后保留的行数 */
+
+/*
+ * skip 行降频：连续 skip 时每 SKIP_LOG_EVERY 次才记一行，
+ * 中间用计数汇总。避免日志被无信息的 skip 淹没。
+ */
+#define SKIP_LOG_EVERY  5
+
 static volatile sig_atomic_t g_running = 1;
 static FILE *g_log = NULL;
+static const char *g_logpath = "/dev/null";
+static unsigned long g_lines = 0;   /* 本次启动写入的行数（轮转后重新计数） */
 
 static void on_sig(int s) { (void)s; g_running = 0; }
 
@@ -69,6 +86,57 @@ static void now_str(char *buf, size_t n)
     struct tm tm_;
     localtime_r(&t, &tm_);
     strftime(buf, n, "%Y-%m-%d %H:%M:%S", &tm_);
+}
+
+/* 保留文件末尾 keep 行：读入内存后截断重写，避免依赖外部命令 */
+static void log_rotate(unsigned long keep)
+{
+    if (!g_log) return;
+    fflush(g_log);
+
+    FILE *r = fopen(g_logpath, "r");
+    if (!r) return;
+
+    /* 先统计总行数 */
+    unsigned long total = 0;
+    int c;
+    while ((c = fgetc(r)) != EOF) if (c == '\n') total++;
+    if (total <= keep) { fclose(r); return; }
+
+    unsigned long start = total - keep;   /* 丢弃前 start 行 */
+    rewind(r);
+    unsigned long seen = 0;
+    char *buf = NULL;
+    size_t cap = 0, len = 0;
+
+    while ((c = fgetc(r)) != EOF) {
+        if (seen >= start) {
+            if (len + 1 >= cap) {
+                cap = cap ? cap * 2 : 8192;
+                char *nb = realloc(buf, cap);
+                if (!nb) { free(buf); fclose(r); return; }
+                buf = nb;
+            }
+            buf[len++] = (char)c;
+        }
+        if (c == '\n') seen++;
+    }
+    fclose(r);
+    if (!buf) return;
+
+    FILE *w = fopen(g_logpath, "w");
+    if (!w) { free(buf); return; }
+    fwrite(buf, 1, len, w);
+    fclose(w);
+    free(buf);
+
+    /* 重新以追加方式打开，保持 plog 可用 */
+    if (freopen(g_logpath, "a", g_log) == NULL) {
+        fclose(g_log);
+        g_log = fopen(g_logpath, "a");
+        if (!g_log) return;
+    }
+    g_lines = keep;
 }
 
 static void plog(const char *fmt, ...)
@@ -83,6 +151,8 @@ static void plog(const char *fmt, ...)
     va_end(ap);
     fputc('\n', g_log);
     fflush(g_log);
+
+    if (++g_lines >= LOG_MAX_LINES) log_rotate(LOG_KEEP_LINES);
 }
 
 /* 读 mm_stat 第 8 个字段 = huge 页数；失败返回 -1 */
@@ -127,6 +197,7 @@ static int psi_arm(void)
 int main(int argc, char **argv)
 {
     const char *logpath = (argc > 1) ? argv[1] : "/dev/null";
+    g_logpath = logpath;
     g_log = fopen(logpath, "a");
 
     signal(SIGTERM, on_sig);
@@ -144,6 +215,7 @@ int main(int argc, char **argv)
     time_t last_check = 0;
     time_t last_comp  = 0;
     long last_residual = 0;
+    unsigned long skip_streak = 0;
     long peak = 0;
     unsigned long n_check = 0, n_comp = 0, n_psi = 0;
 
@@ -223,6 +295,7 @@ int main(int argc, char **argv)
         if (huge > th) {
             plog("evt=%s huge=%ld > %ld%s -> recompress",
                  fired ? "psi" : "idle", huge, th, in_hyst ? "(hyst)" : "");
+            skip_streak = 0;
             if (do_recompress() == 0) {
                 long after = read_huge();
                 plog("  done: %ld -> %ld (-%ld, -%.1f%%)",
@@ -235,8 +308,17 @@ int main(int argc, char **argv)
                 plog("  recompress FAILED: %s", strerror(errno));
             }
         } else {
-            plog("evt=%s huge=%ld <= %ld%s skip (peak=%ld)",
-                 fired ? "psi" : "idle", huge, th, in_hyst ? "(hyst)" : "", peak);
+            /*
+             * skip 行占日志 85%，连续 skip 时降频记录：
+             * 每 SKIP_LOG_EVERY 次才写一行，中间静默。
+             * 这样既不丢趋势，也不会淹没真正的压缩记录。
+             */
+            skip_streak++;
+            if (skip_streak % SKIP_LOG_EVERY == 1) {
+                plog("evt=%s huge=%ld <= %ld%s skip x%lu (peak=%ld)",
+                     fired ? "psi" : "idle", huge, th, in_hyst ? "(hyst)" : "",
+                     skip_streak, peak);
+            }
         }
     }
 
