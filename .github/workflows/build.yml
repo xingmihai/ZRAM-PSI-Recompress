@@ -22,22 +22,40 @@ jobs:
         with:
           ndk-version: r27c
 
-      - name: Build arm64 static binary
+      - name: Build arm64 binary
         run: |
           set -e
-          CC="${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
-          echo "CC=$CC"
+          NDK="${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64"
+          # API 31(Android 12)；不用 -static，原因见下
+          CC="$NDK/bin/aarch64-linux-android31-clang"
           $CC --version | head -1
           mkdir -p build
-          $CC -O2 -static -Wall -Wextra -o build/psi_recomp src/psi_recomp.c
+          # 不使用 -static：NDK 静态二进制在 Android 15/16 上会被 linker 拒绝
+          #   "executable's TLS segment is underaligned: alignment is 8, needs at least 64"
+          # 改为动态 PIE 链接（仅依赖 Bionic libc，late_start 阶段 /system 已挂载）
+          # 同时按 16KB 对齐以兼容 16KB page size 内核（4KB 设备上同样安全）
+          $CC -O2 -fPIE -pie -Wall -Wextra \
+              -Wl,-z,max-page-size=65536 \
+              -Wl,-z,common-page-size=65536 \
+              -o build/psi_recomp src/psi_recomp.c
           chmod 0755 build/psi_recomp
+          echo "--- 依赖动态库 ---"
+          "$NDK/bin/llvm-readelf" -d build/psi_recomp | grep -E "NEEDED|soname" || true
           ls -la build/
 
-      - name: Verify architecture
+      - name: Verify TLS alignment
         run: |
           set -e
-          "${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -h build/psi_recomp | grep -E "Machine|Class"
-          file build/psi_recomp 2>/dev/null || true
+          NDK="${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64"
+          echo "--- Program Headers (关注 TLS 段 Align) ---"
+          "$NDK/bin/llvm-readelf" -l build/psi_recomp
+          ALIGN=$("$NDK/bin/llvm-readelf" -l build/psi_recomp | awk '/TLS/{print $NF; exit}')
+          echo "TLS align = $ALIGN"
+          if [ -n "$ALIGN" ] && [ "$ALIGN" -lt 64 ]; then
+            echo "❌ TLS alignment < 64，Android 15/16 会拒绝执行"
+            exit 1
+          fi
+          echo "✅ TLS 对齐检查通过"
 
       - name: Assemble Magisk module
         run: |
