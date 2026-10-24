@@ -1,0 +1,67 @@
+name: Build ZRAM PSI Recompress Module
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+
+      - name: Build arm64 static binary
+        run: |
+          set -e
+          CC="${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
+          echo "CC=$CC"
+          $CC --version | head -1
+          mkdir -p build
+          $CC -O2 -static -Wall -Wextra -o build/psi_recomp src/psi_recomp.c
+          chmod 0755 build/psi_recomp
+          ls -la build/
+
+      - name: Verify architecture
+        run: |
+          set -e
+          "${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -h build/psi_recomp | grep -E "Machine|Class"
+          file build/psi_recomp 2>/dev/null || true
+
+      - name: Assemble Magisk module
+        run: |
+          set -e
+          rm -rf stage && mkdir -p stage
+          cp -r module/* stage/
+          cp build/psi_recomp stage/psi_recomp
+          chmod 0755 stage/psi_recomp stage/service.sh
+          find stage -type f | sort
+          echo "--- module size ---"
+          du -sh stage
+
+      - name: Package
+        run: |
+          set -e
+          cd stage
+          zip -r ../ZRAM-PSI-Recompress.zip . -x ".*"
+          cd ..
+          ls -la ZRAM-PSI-Recompress.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZRAM-PSI-Recompress
+          path: ZRAM-PSI-Recompress.zip
+
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ZRAM-PSI-Recompress.zip
