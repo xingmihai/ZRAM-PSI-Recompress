@@ -399,3 +399,60 @@ body {
 ::-webkit-scrollbar-thumb:hover {
     background: var(--text-secondary);
 }
+
+/* ========== 滑块控件（v1.2.1） ========== */
+.slider-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.slider {
+    -webkit-appearance: none;
+    appearance: none;
+    flex: 1;
+    height: 6px;
+    border-radius: 3px;
+    background: linear-gradient(90deg, #4a9eff 0%, #4a9eff 50%, #2a2f3a 50%, #2a2f3a 100%);
+    outline: none;
+    transition: background 0.2s;
+}
+
+.slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: #4a9eff;
+    cursor: pointer;
+    border: 2px solid #1a1d24;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4);
+}
+
+.slider::-webkit-slider-thumb:active {
+    transform: scale(1.15);
+    background: #6bb3ff;
+}
+
+.slider::-moz-range-thumb {
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: #4a9eff;
+    cursor: pointer;
+    border: 2px solid #1a1d24;
+}
+
+.slider-val {
+    min-width: 72px;
+    text-align: right;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 13px;
+    font-weight: 600;
+    color: #6bb3ff;
+    background: rgba(74, 158, 255, 0.1);
+    padding: 4px 8px;
+    border-radius: 4px;
+    flex-shrink: 0;
+}
