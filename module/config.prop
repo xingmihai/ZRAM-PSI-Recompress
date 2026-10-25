@@ -22,3 +22,14 @@ ZRAM_SIZE=8589934592
 #   LOG_MAX_LINES=600
 #   LOG_KEEP_LINES=300
 #   SKIP_LOG_EVERY=5
+
+# ========== 看门狗（守护进程存活保障） ==========
+# 守护进程若被 LMK / 异常信号杀掉，重压缩会静默失效。
+# 看门狗每 PSI_WATCHDOG_SEC 秒检测一次，发现进程消失就重新拉起。
+# 连续失败 PSI_WATCHDOG_RETRY 次后停止重试，避免空转刷日志。
+
+# 检测间隔（秒），默认 300
+PSI_WATCHDOG_SEC=300
+
+# 连续拉起失败上限，默认 5
+PSI_WATCHDOG_RETRY=5
