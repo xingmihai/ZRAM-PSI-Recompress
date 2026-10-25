@@ -20,6 +20,13 @@
  *
  * 用法: psi_recomp <logpath> [configpath]
  *
+ * v1.2.3 变更：
+ *   - 修复 psi_events 计数错位：原实现在 poll() 返回处就 n_psi++，
+ *     位于限流闸门之前，被 MIN_GAP_SEC 丢弃的唤醒也被计入，
+ *     导致 psi_events > checks（实测 23/12 = 192%）。
+ *     改为仅在实际执行检查后才计数，并新增 psi_throttled
+ *     单独统计被丢弃的唤醒次数（可用于判断 PSI 触发是否过敏感）。
+ *
  * v1.2.2 变更：
  *   - 修复 WebUI 统计恒为 0：原实现只解析日志里的 stats/exit 行，
  *     而 stats 每 10 次压缩才输出、exit 仅在进程退出时输出，
@@ -138,6 +145,7 @@ static void remove_pid_file(void)
  * 也不受日志轮转影响。
  */
 static void write_stats_file(unsigned long n_check, unsigned long n_psi,
+                             unsigned long n_throttled,
                              unsigned long n_comp, long peak, long huge,
                              time_t last_comp)
 {
@@ -148,6 +156,7 @@ static void write_stats_file(unsigned long n_check, unsigned long n_psi,
 
     fprintf(f, "checks=%lu\n", n_check);
     fprintf(f, "psi_events=%lu\n", n_psi);
+    fprintf(f, "psi_throttled=%lu\n", n_throttled);
     fprintf(f, "recompress=%lu\n", n_comp);
     fprintf(f, "peak=%ld\n", peak);
     fprintf(f, "total_saved=%lu\n", g_total_saved_pages);
@@ -441,7 +450,7 @@ int main(int argc, char **argv)
     protect_from_oom();
     set_low_priority();
     write_pid_file();
-    write_stats_file(0, 0, 0, 0, -1, 0);   /* 初始占位，避免 WebUI 读到空文件 */
+    write_stats_file(0, 0, 0, 0, 0, -1, 0);   /* 初始占位，避免 WebUI 读到空文件 */
 
     plog("=== psi_recomp start (pid=%d, thresh=%ld, hyst=%ds/+%ld, gap=%lds) ===",
          getpid(), g_thresh_normal, g_hysteresis_sec, g_hyst_margin, g_min_gap_sec);
@@ -451,7 +460,7 @@ int main(int argc, char **argv)
     long last_residual = 0;
     unsigned long skip_streak = 0;
     long peak = 0;
-    unsigned long n_check = 0, n_comp = 0, n_psi = 0;
+    unsigned long n_check = 0, n_comp = 0, n_psi = 0, n_throttled = 0;
 
     /* 先探测一次：PSI 是否可用，不可用则全程走定时 */
     int psi_ok = 0;
@@ -495,8 +504,12 @@ int main(int argc, char **argv)
                     close(psi); psi = -1;
                     psi_ok = 0;
                 } else if (r > 0) {
+                    /*
+                     * 只标记 fired，不在这里计数。
+                     * 原先 n_psi++ 放在限流闸门之前，导致被限流丢弃的
+                     * 唤醒也计入，出现 psi_events > checks（如 23/12=192%）。
+                     */
                     fired = 1;
-                    n_psi++;
                 }
             }
         }
@@ -513,11 +526,18 @@ int main(int argc, char **argv)
          */
         if (last_check && (now - last_check) < g_min_gap_sec) {
             long wait = g_min_gap_sec - (now - last_check);
+            /*
+             * 被限流丢弃的 PSI 唤醒单独统计：
+             * 该值偏高说明 PSI 触发条件过于敏感，
+             * 可考虑调大 PSI_TRIGGER 中的 stall_us。
+             */
+            if (fired) n_throttled++;
             if (wait > 0) sleep_full(wait);
             continue;
         }
         last_check = now;
         n_check++;
+        if (fired) n_psi++;
 
         long huge = read_huge();
         if (huge < 0) {
@@ -527,7 +547,7 @@ int main(int argc, char **argv)
         if (huge > peak) peak = huge;
 
         /* 每次检查后立即落盘，WebUI 读到的是实时值 */
-        write_stats_file(n_check, n_psi, n_comp, peak, huge, last_comp);
+        write_stats_file(n_check, n_psi, n_throttled, n_comp, peak, huge, last_comp);
 
         /* 滞回：门槛 = 上次残留 + margin */
         int in_hyst = (last_comp != 0) && ((now - last_comp) < g_hysteresis_sec);
@@ -551,7 +571,7 @@ int main(int argc, char **argv)
                 last_comp = now;
                 if (after > 0) last_residual = after;
                 n_comp++;
-                write_stats_file(n_check, n_psi, n_comp, peak, after, last_comp);
+                write_stats_file(n_check, n_psi, n_throttled, n_comp, peak, after, last_comp);
 
                 /* 每 10 次压缩输出一次累计统计 */
                 if (n_comp % 10 == 0) {
@@ -572,8 +592,8 @@ int main(int argc, char **argv)
         }
     }
 
-    plog("=== exit: checks=%lu psi_events=%lu recompress=%lu peak=%ld total_saved=%lu pages (%.1f MiB) ===",
-         n_check, n_psi, n_comp, peak,
+    plog("=== exit: checks=%lu psi_events=%lu throttled=%lu recompress=%lu peak=%ld total_saved=%lu pages (%.1f MiB) ===",
+         n_check, n_psi, n_throttled, n_comp, peak,
          g_total_saved_pages, (double)g_total_saved_pages / 256.0);
     if (g_log) fclose(g_log);
     remove_pid_file();
