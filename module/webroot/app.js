@@ -113,29 +113,6 @@ async function refreshStatus() {
             psiEl.className = 'status-value warn';
         }
 
-        // 看门狗状态（读心跳时间戳）
-        const { stdout: wdOut } = await exec(
-            `cat ${moduleDir}/psi_watchdog.heartbeat 2>/dev/null || echo "0"`
-        );
-        const wdTs = parseInt(wdOut.trim()) || 0;
-        const wdEl = document.getElementById('watchdog-status');
-        if (wdEl) {
-            if (wdTs > 0) {
-                const age = Math.floor(Date.now() / 1000) - wdTs;
-                /* 超过 2 个检测周期没心跳，认为已停止 */
-                if (age <= 700) {
-                    wdEl.textContent = '运行中';
-                    wdEl.className = 'status-value ok';
-                } else {
-                    wdEl.textContent = '已停止';
-                    wdEl.className = 'status-value warn';
-                }
-            } else {
-                wdEl.textContent = '未启用';
-                wdEl.className = 'status-value';
-            }
-        }
-
         // ZRAM 算法
         const { stdout: algoOut } = await exec(
             `cat /sys/block/zram0/comp_algorithm 2>/dev/null | grep -o '\\[.*\\]' | tr -d '[]' || echo "-"`
@@ -568,16 +545,15 @@ async function restartDaemon() {
            必须等一小会儿后用 ps 实际检测进程。
            同时重写 PID 文件：旧进程退出时可能删掉新进程写的 PID。 */
         await new Promise(r => setTimeout(r, 1500));
-        /* 扫描 /proc/<pid>/comm，比 ps|grep 可靠：
-           不受 ps 输出格式影响，也不会把 grep 自身算进去 */
         const { stdout: psOut } = await exec(
-            `p=""; for d in /proc/[0-9]*; do ` +
-            `[ "$(cat $d/comm 2>/dev/null)" = "psi_recomp" ] && { p=${d#/proc/}; break; }; done; ` +
-            `echo ${p:-0}`
+            `ps -A 2>/dev/null | grep -c "[p]si_recomp" || echo 0`
         );
-        const pidOut = psOut.trim().split(/\s+/).pop() || '0';
-        const alive = parseInt(pidOut) > 0;
-        if (alive) await exec(`echo ${pidOut} > ${moduleDir}/psi_recomp.pid`);
+        const alive = parseInt(psOut.trim()) > 0;
+        if (alive) {
+            await exec(`${moduleDir}/psi_recomp --pid 2>/dev/null; true`);
+            const { stdout: p } = await exec(`ps -A 2>/dev/null | grep "[p]si_recomp" | awk '{print $2}' | head -1`);
+            if (p.trim()) await exec(`echo ${p.trim()} > ${moduleDir}/psi_recomp.pid`);
+        }
 
         if (alive) {
             showActionResult('守护进程已重启', 'success');
