@@ -116,6 +116,69 @@ fi
 # helper 已运行时不再启动，避免两套逻辑同时重压缩
 if [ -n "$DAEMON_PID" ]; then
   echo "psi mode active, shell loop skipped" >> "$LOG"
+
+  # ---------------- 看门狗 ----------------
+  # 守护进程可能因以下原因消失：
+  #   1. 被 LMK 杀掉（已设 oom_score_adj=-800 降低概率，但不能完全避免）
+  #   2. 内核 OOM、异常信号
+  #   3. 模块被禁用后重新启用
+  # 一旦消失，重压缩就静默失效，用户完全无感知。
+  # 故启动一个独立看门狗循环，定期检测并在必要时拉起。
+  #
+  # 注意：必须放在 exit 0 之前，并用 setsid 脱离进程组，
+  # 否则主脚本退出时可能被一并清理。
+  (
+    WD_GAP=${PSI_WATCHDOG_SEC:-300}      # 检测间隔，默认 5 分钟
+    WD_MAX_RETRY=${PSI_WATCHDOG_RETRY:-5} # 连续失败上限，超限停止重试
+    WD_FAIL=0
+
+    # 降低自身被 LMK 杀掉的概率
+    echo -800 > /proc/self/oom_score_adj 2>/dev/null
+
+    # 直接扫描 /proc/<pid>/comm —— 内核维护的进程名，最可靠：
+    #   - 不依赖 ps 输出格式（各实现差异大）
+    #   - 不会把用户终端里的 `grep psi_recomp` 误判成守护进程
+    #     （grep 的 comm 是 "grep"；若 ps 显示完整命令行则连 awk 也救不了）
+    #   - 不依赖 PID 文件（可能被旧进程退出时误删）
+    #   - 不受 PID 复用影响（校验的是进程名而非仅 PID）
+    wd_alive() {
+      for d in /proc/[0-9]*; do
+        [ "$(cat "$d/comm" 2>/dev/null)" = "psi_recomp" ] && return 0
+      done
+      return 1
+    }
+
+    while true; do
+      # 模块目录不存在说明已被卸载，自行退出
+      [ -d "$MODDIR" ] || break
+
+      # 写心跳时间戳，便于外部确认看门狗本身是否存活
+      date +%s > "$MODDIR/psi_watchdog.heartbeat" 2>/dev/null
+
+      sleep "$WD_GAP"
+
+      if wd_alive; then
+        [ "$WD_FAIL" -ne 0 ] && echo "$(date '+%F %H:%M:%S') watchdog: daemon recovered" >> "$LOG"
+        WD_FAIL=0
+        continue
+      fi
+
+      WD_FAIL=$((WD_FAIL + 1))
+      if [ "$WD_FAIL" -gt "$WD_MAX_RETRY" ]; then
+        echo "$(date '+%F %H:%M:%S') watchdog: 连续 ${WD_MAX_RETRY} 次拉起失败，停止重试" >> "$LOG"
+        break
+      fi
+
+      echo "$(date '+%F %H:%M:%S') watchdog: psi_recomp 已消失，第 ${WD_FAIL} 次拉起" >> "$LOG"
+      chmod 0755 "$MODDIR/psi_recomp" 2>/dev/null
+      if [ -f "$MODDIR/psi.conf" ]; then
+        setsid "$MODDIR/psi_recomp" "$MODDIR/psi.log" "$MODDIR/psi.conf" &
+      else
+        setsid "$MODDIR/psi_recomp" "$MODDIR/psi.log" &
+      fi
+    done
+  ) &
+
   exit 0
 fi
 
