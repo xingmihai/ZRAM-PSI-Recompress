@@ -143,50 +143,87 @@ async function refreshStatus() {
 }
 
 // ========== 统计刷新 ==========
+
+/* 解析 key=value 格式的 psi_stats 状态文件 */
+function parseStatsFile(content) {
+    const out = {};
+    content.split('\n').forEach(line => {
+        const t = line.trim();
+        if (!t) return;
+        const i = t.indexOf('=');
+        if (i < 0) return;
+        out[t.substring(0, i).trim()] = t.substring(i + 1).trim();
+    });
+    return out;
+}
+
 async function refreshStats() {
     try {
-        // 从 psi.log 解析统计
-        const { stdout: logOut } = await exec(
-            `tail -50 ${moduleDir}/psi.log 2>/dev/null || echo ""`
+        let checks = 0, psiEvents = 0, compress = 0, saved = 0, peak = 0, huge = -1;
+
+        /*
+         * 优先读取守护进程实时写入的 psi_stats。
+         * 原先只解析日志里的 stats/exit 行，而 stats 每 10 次压缩才输出、
+         * exit 只在进程退出时输出 —— 运行中两者都没有，导致恒显示 0。
+         */
+        const { stdout: statOut } = await exec(
+            `cat ${moduleDir}/psi_stats 2>/dev/null || echo ""`
         );
+        const st = parseStatsFile(statOut);
 
-        let checks = 0, compress = 0, saved = 0, peak = 0;
-
-        // 解析 exit 行或 stats 行
-        const statsMatch = logOut.match(/stats: total_comp=(\d+), total_saved=(\d+) pages.*?peak=(\d+)/);
-        const exitMatch = logOut.match(/exit: checks=(\d+) psi_events=(\d+) recompress=(\d+) peak=(\d+) total_saved=(\d+) pages/);
-
-        if (statsMatch) {
-            compress = parseInt(statsMatch[1]);
-            saved = parseInt(statsMatch[2]);
-            peak = parseInt(statsMatch[3]);
-        } else if (exitMatch) {
-            checks = parseInt(exitMatch[1]);
-            compress = parseInt(exitMatch[3]);
-            peak = parseInt(exitMatch[4]);
-            saved = parseInt(exitMatch[5]);
+        if (st.checks !== undefined) {
+            checks = parseInt(st.checks) || 0;
+            psiEvents = parseInt(st.psi_events) || 0;
+            compress = parseInt(st.recompress) || 0;
+            peak = parseInt(st.peak) || 0;
+            saved = parseInt(st.total_saved) || 0;
+            huge = parseInt(st.huge);
+        } else {
+            /* 回退：老版本守护进程没有状态文件，仍解析日志 */
+            const { stdout: logOut } = await exec(
+                `tail -50 ${moduleDir}/psi.log 2>/dev/null || echo ""`
+            );
+            const statsMatch = logOut.match(/stats: total_comp=(\d+), total_saved=(\d+) pages.*?peak=(\d+)/);
+            const exitMatch = logOut.match(/exit: checks=(\d+) psi_events=(\d+) recompress=(\d+) peak=(\d+) total_saved=(\d+) pages/);
+            if (statsMatch) {
+                compress = parseInt(statsMatch[1]);
+                saved = parseInt(statsMatch[2]);
+                peak = parseInt(statsMatch[3]);
+            } else if (exitMatch) {
+                checks = parseInt(exitMatch[1]);
+                psiEvents = parseInt(exitMatch[2]);
+                compress = parseInt(exitMatch[3]);
+                peak = parseInt(exitMatch[4]);
+                saved = parseInt(exitMatch[5]);
+            }
+            const { stdout: lineCount } = await exec(
+                `wc -l < ${moduleDir}/psi.log 2>/dev/null || echo "0"`
+            );
+            checks = Math.max(checks, parseInt(lineCount.trim()) || 0);
         }
 
-        // 统计检查次数（从日志行数估算）
-        const { stdout: lineCount } = await exec(
-            `wc -l < ${moduleDir}/psi.log 2>/dev/null || echo "0"`
-        );
-        const totalLines = parseInt(lineCount.trim());
-        checks = Math.max(checks, totalLines);
-
-        // 计算节省 MiB
-        const savedMiB = (saved * 4 / 1024).toFixed(1);
+        /* 4096 字节/页 -> MiB：pages / 256 */
+        const savedMiB = (saved / 256).toFixed(1);
 
         document.getElementById('stat-checks').textContent = checks.toLocaleString();
         document.getElementById('stat-compress').textContent = compress.toLocaleString();
         document.getElementById('stat-saved').textContent = savedMiB;
         document.getElementById('stat-peak').textContent = peak > 0 ? peak.toLocaleString() : '-';
 
+        /* 有 psi_events 字段时顺带展示 PSI 事件占比 */
+        const psiEl = document.getElementById('stat-psi-events');
+        if (psiEl) {
+            psiEl.textContent = checks > 0
+                ? psiEvents.toLocaleString() + ' (' + Math.round(psiEvents / checks * 100) + '%)'
+                : '-';
+        }
+        const hugeEl = document.getElementById('stat-huge');
+        if (hugeEl) hugeEl.textContent = huge >= 0 ? huge.toLocaleString() : '-';
+
     } catch (e) {
         console.error('refreshStats error:', e);
     }
 }
-
 
 // ========== 滑块辅助（v1.2.1） ==========
 
