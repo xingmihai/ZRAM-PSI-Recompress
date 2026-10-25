@@ -161,6 +161,10 @@ async function refreshStats() {
     try {
         let checks = 0, psiEvents = 0, compress = 0, saved = 0, peak = 0, huge = -1;
         let lastComp = 0;
+        /* 必须在 if 块外声明：下方 thrEl 处会用到，
+           块内 const 会导致 ReferenceError 被 catch 静默吞掉，
+           连带后面「距上次压缩」也不再执行，两格恒显示 - */
+        let throttled = 0;
 
         /*
          * 优先读取守护进程实时写入的 psi_stats。
@@ -175,7 +179,7 @@ async function refreshStats() {
         if (st.checks !== undefined) {
             checks = parseInt(st.checks) || 0;
             psiEvents = parseInt(st.psi_events) || 0;
-            const throttled = parseInt(st.psi_throttled) || 0;
+            throttled = parseInt(st.psi_throttled) || 0;
             compress = parseInt(st.recompress) || 0;
             peak = parseInt(st.peak) || 0;
             saved = parseInt(st.total_saved) || 0;
