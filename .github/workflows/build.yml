@@ -16,6 +16,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Sync version from source to module.prop
+        run: |
+          set -e
+          # 从 psi_recomp.c 头部注释提取版本号
+          VERSION=$(grep -oP 'v\d+\.\d+\.\d+' src/psi_recomp.c | head -1)
+          if [ -n "$VERSION" ]; then
+            echo "Detected version: $VERSION"
+            sed -i "s/version=.*/version=$VERSION/" module/module.prop
+            # versionCode: v1.2.3 -> 10203
+            VCODE=$(echo "$VERSION" | sed 's/v//' | awk -F. '{printf "%d%02d%02d", $1, $2, $3}')
+            sed -i "s/versionCode=.*/versionCode=$VCODE/" module/module.prop
+            echo "Updated module.prop:"
+            cat module/module.prop
+          else
+            echo "No version found in source, keeping existing module.prop"
+          fi
+
       - name: Setup Android NDK
         uses: nttld/setup-ndk@v1
         id: setup-ndk
@@ -34,7 +51,7 @@ jobs:
           #   "executable's TLS segment is underaligned: alignment is 8, needs at least 64"
           # 改为动态 PIE 链接（仅依赖 Bionic libc，late_start 阶段 /system 已挂载）
           # 同时按 16KB 对齐以兼容 16KB page size 内核（4KB 设备上同样安全）
-          $CC -O2 -fPIE -pie -Wall -Wextra \
+          $CC -O2 -fPIE -pie -Wall -Wextra -Wshadow \
               -Wl,-z,max-page-size=65536 \
               -Wl,-z,common-page-size=65536 \
               -o build/psi_recomp src/psi_recomp.c

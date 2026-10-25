@@ -1,3 +1,5 @@
+# ========== ZRAM 基础配置 ==========
+
 # 算法名
 # lz4 zstd lzo lzo-rle lz4k lz4hc lz4kd 842 zstdn
 ZRAM_ALGO=lz4kd
@@ -5,3 +7,18 @@ ZRAM_ALGO=lz4kd
 # ZRAM字节数
 # 8589934592(8G) 12884901888(12G) 17179869184(16G) 25769803776(24G)
 ZRAM_SIZE=8589934592
+
+# ========== psi_recomp 守护进程参数（可选，缺省用编译默认值） ==========
+# 以下参数仅在存在 psi.conf 时生效；如需调参请创建 module/psi.conf 文件
+# 格式：KEY=VALUE，每行一个，# 开头为注释
+#
+# 示例 psi.conf:
+#   THRESH_NORMAL=40000
+#   HYSTERESIS_SEC=5400
+#   HYST_MARGIN=8000
+#   MIN_GAP_SEC=60
+#   IDLE_TIMEOUT_MS=1800000
+#   PSI_TRIGGER=some 15000 1000000
+#   LOG_MAX_LINES=600
+#   LOG_KEEP_LINES=300
+#   SKIP_LOG_EVERY=5

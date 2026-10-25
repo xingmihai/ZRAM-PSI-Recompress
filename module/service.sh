@@ -67,18 +67,47 @@ cat /sys/block/zram0/comp_algorithm >> "$LOG" 2>&1
 if [ -f "$MODDIR/psi_recomp" ]; then
   chmod 0755 "$MODDIR/psi_recomp" 2>/dev/null
   echo "starting psi_recomp daemon (mode=$(stat -c '%a' "$MODDIR/psi_recomp" 2>/dev/null))" >> "$LOG"
-  # setsid 脱离会话/进程组，避免 ksud 清理时把守护连坐杀掉
-  # 注意：setsid 可能 fork，$! 未必是守护真实 PID，
-  # 故不以 kill -0 判活，改用「日志是否出现 start」判定，更可靠
+
+  # 清理旧 PID 文件和日志
+  rm -f "$MODDIR/psi_recomp.pid"
   : > "$MODDIR/psi.log"
-  setsid "$MODDIR/psi_recomp" "$MODDIR/psi.log" &
+
+  # 构建可选配置文件路径
+  PSI_CONF="$MODDIR/psi.conf"
+  if [ -f "$PSI_CONF" ]; then
+    echo "using config: $PSI_CONF" >> "$LOG"
+    setsid "$MODDIR/psi_recomp" "$MODDIR/psi.log" "$PSI_CONF" &
+  else
+    setsid "$MODDIR/psi_recomp" "$MODDIR/psi.log" &
+  fi
+
+  HELPER_PID=$!
   sleep 3
-  if grep -q "psi_recomp start" "$MODDIR/psi.log" 2>/dev/null; then
-    echo "psi_recomp running: $(head -1 "$MODDIR/psi.log")" >> "$LOG"
+
+  # 双重检测：日志有 start 且 PID 文件已写入
+  PID_ALIVE=""
+  if [ -f "$MODDIR/psi_recomp.pid" ]; then
+    PID_IN_FILE=$(cat "$MODDIR/psi_recomp.pid" 2>/dev/null)
+    if [ -n "$PID_IN_FILE" ] && kill -0 "$PID_IN_FILE" 2>/dev/null; then
+      PID_ALIVE="$PID_IN_FILE"
+    fi
+  fi
+
+  # 如果 PID 文件检测失败，回退到 $! 检测（setsid 可能 fork，$! 未必准确）
+  if [ -z "$PID_ALIVE" ] && kill -0 "$HELPER_PID" 2>/dev/null; then
+    PID_ALIVE="$HELPER_PID"
+  fi
+
+  if grep -q "psi_recomp start" "$MODDIR/psi.log" 2>/dev/null && [ -n "$PID_ALIVE" ]; then
+    echo "psi_recomp running (pid=$PID_ALIVE)" >> "$LOG"
     DAEMON_PID=1
   else
-    echo "psi_recomp no start marker, wait for fallback" >> "$LOG"
+    echo "psi_recomp failed to start, falling back to shell loop" >> "$LOG"
     echo "  psi.log: $(cat "$MODDIR/psi.log" 2>/dev/null)" >> "$LOG"
+    # 清理可能残留的进程
+    [ -n "$HELPER_PID" ] && kill "$HELPER_PID" 2>/dev/null
+    [ -n "$PID_IN_FILE" ] && kill "$PID_IN_FILE" 2>/dev/null
+    rm -f "$MODDIR/psi_recomp.pid"
     DAEMON_PID=""
   fi
 fi
@@ -94,8 +123,8 @@ fi
 RLOG="$MODDIR/recompress.log"
 ST="$MODDIR/status"
 : > "$RLOG"
-THRESH=40000
-IDLE=1800
+THRESH=${PSI_THRESH_NORMAL:-40000}
+IDLE=${PSI_IDLE_SEC:-1800}
 while true; do
   huge=$(awk '{print $8}' /sys/block/zram0/mm_stat)
   ts=$(date '+%F %H:%M:%S')
