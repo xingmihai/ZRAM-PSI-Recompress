@@ -20,6 +20,14 @@
  *
  * 用法: psi_recomp <logpath> [configpath]
  *
+ * v1.2.2 变更：
+ *   - 修复 WebUI 统计恒为 0：原实现只解析日志里的 stats/exit 行，
+ *     而 stats 每 10 次压缩才输出、exit 仅在进程退出时输出，
+ *     运行中的守护进程两者皆无，故重压缩次数/累计节省/峰值全显示 0。
+ *     改为每次检查后写 psi_stats 状态文件，WebUI 直接读取，
+ *     不依赖日志解析，也不受日志轮转影响。
+ *   - 状态文件额外提供 psi_events、当前 huge、last_comp、pid
+ *
  * v1.2.1 变更：
  *   - 修复限流忙循环：PSI 持续触发时 continue 直接回到循环顶部，
  *     poll() 立即返回形成 arm/poll/continue 空转，每轮还开关 /proc 文件，
@@ -80,6 +88,7 @@ static volatile sig_atomic_t g_running = 1;
 static FILE *g_log = NULL;
 static const char *g_logpath = "/dev/null";
 static const char *g_pidpath = NULL;
+static const char *g_statspath = NULL;   /* 实时统计状态文件，供 WebUI 读取 */
 static unsigned long g_lines = 0;
 static unsigned long g_total_saved_pages = 0;   /* 累计节省的 huge 页数 */
 
@@ -118,6 +127,36 @@ static void write_pid_file(void)
 static void remove_pid_file(void)
 {
     if (g_pidpath) unlink(g_pidpath);
+}
+
+/*
+ * 写实时统计状态文件。
+ *
+ * 背景：原先统计只在两处输出 —— 每 10 次压缩一条 stats 行、进程退出一条
+ * exit 行。运行中的守护进程两者都没有，WebUI 只能显示 0。
+ * 改为每次检查后立即落盘，WebUI 直接读文件，不再依赖日志解析，
+ * 也不受日志轮转影响。
+ */
+static void write_stats_file(unsigned long n_check, unsigned long n_psi,
+                             unsigned long n_comp, long peak, long huge,
+                             time_t last_comp)
+{
+    if (!g_statspath) return;
+
+    FILE *f = fopen(g_statspath, "w");
+    if (!f) return;
+
+    fprintf(f, "checks=%lu\n", n_check);
+    fprintf(f, "psi_events=%lu\n", n_psi);
+    fprintf(f, "recompress=%lu\n", n_comp);
+    fprintf(f, "peak=%ld\n", peak);
+    fprintf(f, "total_saved=%lu\n", g_total_saved_pages);
+    fprintf(f, "total_saved_mib=%.1f\n", (double)g_total_saved_pages / 256.0);
+    fprintf(f, "huge=%ld\n", huge);
+    fprintf(f, "last_comp=%ld\n", (long)last_comp);
+    fprintf(f, "updated=%ld\n", (long)time(NULL));
+    fprintf(f, "pid=%d\n", getpid());
+    fclose(f);
 }
 
 /* 提高 OOM 优先级，降低被 LMK 杀掉的概率 */
@@ -381,6 +420,15 @@ int main(int argc, char **argv)
         g_pidpath = pidpath;
     }
 
+    /* 统计文件路径：与日志同目录下的 psi_stats */
+    static char statpath[512];
+    snprintf(statpath, sizeof(statpath), "%s", logpath);
+    char *slash2 = strrchr(statpath, '/');
+    if (slash2) {
+        strcpy(slash2 + 1, "psi_stats");
+        g_statspath = statpath;
+    }
+
     signal(SIGTERM, on_sig);
     signal(SIGINT,  on_sig);
     signal(SIGHUP,  SIG_IGN);
@@ -393,6 +441,7 @@ int main(int argc, char **argv)
     protect_from_oom();
     set_low_priority();
     write_pid_file();
+    write_stats_file(0, 0, 0, 0, -1, 0);   /* 初始占位，避免 WebUI 读到空文件 */
 
     plog("=== psi_recomp start (pid=%d, thresh=%ld, hyst=%ds/+%ld, gap=%lds) ===",
          getpid(), g_thresh_normal, g_hysteresis_sec, g_hyst_margin, g_min_gap_sec);
@@ -477,6 +526,9 @@ int main(int argc, char **argv)
         }
         if (huge > peak) peak = huge;
 
+        /* 每次检查后立即落盘，WebUI 读到的是实时值 */
+        write_stats_file(n_check, n_psi, n_comp, peak, huge, last_comp);
+
         /* 滞回：门槛 = 上次残留 + margin */
         int in_hyst = (last_comp != 0) && ((now - last_comp) < g_hysteresis_sec);
         long th = g_thresh_normal;
@@ -499,6 +551,7 @@ int main(int argc, char **argv)
                 last_comp = now;
                 if (after > 0) last_residual = after;
                 n_comp++;
+                write_stats_file(n_check, n_psi, n_comp, peak, after, last_comp);
 
                 /* 每 10 次压缩输出一次累计统计 */
                 if (n_comp % 10 == 0) {
