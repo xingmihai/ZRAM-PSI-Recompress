@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <meta name="color-scheme" content="dark light">
+    <title>ZRAM PSI 重压缩守护</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+
+        <!-- 状态卡片 -->
+        <div class="card" id="status-card">
+            <div class="card-header">
+                <span class="card-title">运行状态</span>
+                <span class="badge" id="status-badge">检测中...</span>
+            </div>
+            <div class="status-grid">
+                <div class="status-item">
+                    <div class="status-label">守护进程</div>
+                    <div class="status-value" id="daemon-status">-</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">PID</div>
+                    <div class="status-value" id="daemon-pid">-</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">当前 huge 页</div>
+                    <div class="status-value" id="current-huge">-</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">触发阈值</div>
+                    <div class="status-value" id="current-thresh">-</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">PSI 状态</div>
+                    <div class="status-value" id="psi-status">-</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">ZRAM 算法</div>
+                    <div class="status-value" id="zram-algo">-</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 统计卡片 -->
+        <div class="card" id="stats-card">
+            <div class="card-header">
+                <span class="card-title">压缩统计</span>
+                <button class="btn btn-sm btn-secondary" onclick="refreshStats()">刷新</button>
+            </div>
+            <div class="stats-grid">
+                <div class="stat-box">
+                    <div class="stat-num" id="stat-checks">-</div>
+                    <div class="stat-label">总检查次数</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-num" id="stat-compress">-</div>
+                    <div class="stat-label">重压缩次数</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-num" id="stat-saved">-</div>
+                    <div class="stat-label">累计节省 (MiB)</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-num" id="stat-peak">-</div>
+                    <div class="stat-label">huge 峰值</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 参数配置 -->
+        <div class="card" id="config-card">
+            <div class="card-header">
+                <span class="card-title">参数配置</span>
+                <span class="badge badge-info">psi.conf</span>
+            </div>
+            <div class="form-group">
+                <label for="cfg-thresh">常态触发阈值（huge 页数）</label>
+                <input type="number" id="cfg-thresh" class="input" placeholder="40000">
+                <div class="input-hint">当 huge 页数超过此值时触发重压缩</div>
+            </div>
+            <div class="form-group">
+                <label for="cfg-hyst-sec">滞回持续时间（秒）</label>
+                <input type="number" id="cfg-hyst-sec" class="input" placeholder="5400">
+                <div class="input-hint">刚压完后的这段时间内提高阈值，避免空压</div>
+            </div>
+            <div class="form-group">
+                <label for="cfg-hyst-margin">滞回余量（页数）</label>
+                <input type="number" id="cfg-hyst-margin" class="input" placeholder="8000">
+                <div class="input-hint">滞回期间阈值 = 上次残留 + 此值</div>
+            </div>
+            <div class="form-group">
+                <label for="cfg-min-gap">最小检查间隔（秒）</label>
+                <input type="number" id="cfg-min-gap" class="input" placeholder="60">
+                <div class="input-hint">防止 PSI 风暴导致检查过于频繁</div>
+            </div>
+            <div class="form-group">
+                <label for="cfg-idle-timeout">兜底轮询间隔（毫秒）</label>
+                <input type="number" id="cfg-idle-timeout" class="input" placeholder="1800000">
+                <div class="input-hint">PSI 无事件时最多等待这么久再检查</div>
+            </div>
+            <div class="form-group">
+                <label for="cfg-psi-trigger">PSI 触发条件</label>
+                <input type="text" id="cfg-psi-trigger" class="input" placeholder="some 15000 1000000">
+                <div class="input-hint">格式: some|full stall_us window_us</div>
+            </div>
+            <div class="form-group">
+                <label for="cfg-log-max">日志最大行数</label>
+                <input type="number" id="cfg-log-max" class="input" placeholder="600">
+            </div>
+            <div class="form-group">
+                <label for="cfg-log-keep">日志保留行数</label>
+                <input type="number" id="cfg-log-keep" class="input" placeholder="300">
+            </div>
+            <div class="form-group">
+                <label for="cfg-skip-every">Skip 日志降频</label>
+                <input type="number" id="cfg-skip-every" class="input" placeholder="5">
+                <div class="input-hint">连续 skip 时每 N 次记录一行</div>
+            </div>
+            <div class="btn-group">
+                <button class="btn btn-primary" onclick="saveConfig()">保存配置</button>
+                <button class="btn btn-secondary" onclick="loadConfig()">重新加载</button>
+                <button class="btn btn-danger" onclick="resetConfig()">恢复默认</button>
+            </div>
+        </div>
+
+        <!-- 日志查看 -->
+        <div class="card" id="log-card">
+            <div class="card-header">
+                <span class="card-title">运行日志</span>
+                <div>
+                    <button class="btn btn-sm btn-secondary" onclick="refreshLog()">刷新</button>
+                    <button class="btn btn-sm btn-danger" onclick="clearLog()">清空</button>
+                </div>
+            </div>
+            <div class="log-tabs">
+                <button class="log-tab active" data-log="psi" onclick="switchLog('psi')">psi.log</button>
+                <button class="log-tab" data-log="module" onclick="switchLog('module')">zram_module.log</button>
+                <button class="log-tab" data-log="recompress" onclick="switchLog('recompress')">recompress.log</button>
+            </div>
+            <pre class="log-viewer" id="log-viewer">点击「刷新」加载日志...</pre>
+        </div>
+
+        <!-- 快捷操作 -->
+        <div class="card" id="action-card">
+            <div class="card-header">
+                <span class="card-title">快捷操作</span>
+            </div>
+            <div class="btn-group-vertical">
+                <button class="btn btn-warning" onclick="triggerRecompress()">立即触发重压缩</button>
+                <button class="btn btn-secondary" onclick="restartDaemon()">重启守护进程</button>
+                <button class="btn btn-secondary" onclick="testPSI()">测试 PSI 可用性</button>
+            </div>
+            <div class="action-result" id="action-result"></div>
+        </div>
+
+        <!-- 模块信息 -->
+        <div class="card" id="info-card">
+            <div class="card-header">
+                <span class="card-title">模块信息</span>
+            </div>
+            <div class="info-list" id="module-info">
+                <div class="info-row">
+                    <span class="info-key">版本</span>
+                    <span class="info-value" id="info-version">-</span>
+                </div>
+                <div class="info-row">
+                    <span class="info-key">模块路径</span>
+                    <span class="info-value" id="info-path">-</span>
+                </div>
+                <div class="info-row">
+                    <span class="info-key">ZRAM 大小</span>
+                    <span class="info-value" id="info-zram-size">-</span>
+                </div>
+                <div class="info-row">
+                    <span class="info-key">ZRAM 算法</span>
+                    <span class="info-value" id="info-zram-algo">-</span>
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <script type="module" src="app.js"></script>
+</body>
+</html>

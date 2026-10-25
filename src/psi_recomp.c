@@ -20,6 +20,9 @@
  *
  * 用法: psi_recomp <logpath> [configpath]
  *
+ * v1.2.0 变更：
+ *   - 新增 KernelSU 模块 WebUI 支持
+ *
  * v1.1.0 变更：
  *   - 支持运行时配置文件（psi.conf），无需重新编译即可调参
  *   - 修复 sleep() 被信号中断后提前醒来的问题（改用 nanosleep 循环）

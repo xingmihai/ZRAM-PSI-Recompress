@@ -95,15 +95,31 @@ cat /data/adb/modules/ZRAM-PSI-Recompress/zram_module.log
 [2025-10-24 18:30:00] stats: total_comp=10, total_saved=145230 pages (567.3 MiB), peak=52341
 ```
 
+
+## WebUI（KernelSU）
+
+v1.2.0 起支持 KernelSU 模块 WebUI，可在 KernelSU 管理器中直接：
+
+- 查看守护进程运行状态（PID、huge 页数、PSI 状态）
+- 查看压缩统计（总检查次数、重压缩次数、累计节省内存）
+- 可视化编辑 `psi.conf` 配置参数
+- 实时查看日志（psi.log / zram_module.log / recompress.log）
+- 快捷操作：立即触发重压缩、重启守护进程、测试 PSI
+
+> WebUI 需要 KernelSU 管理器 v0.9.0+，Magisk 用户无影响。
+
 ## 说明
 
 - 需要内核开启 `CONFIG_PSI`（`/proc/pressure/memory` 存在即可）
 - 若缺失自动降级为定时轮询，不会失效
 - `service.sh` 内含纯 shell 兜底循环，helper 缺失/启动失败时接管
 - 守护进程自动设置 `oom_score_adj=-800` 和 `nice=10`，降低被系统杀掉和抢占前台 CPU 的概率
-- v1.1.0 起支持 `psi.conf` 运行时配置，无需重新编译即可调参
+- v1.2.0 起支持 `psi.conf` 运行时配置，无需重新编译即可调参
 
 ## 更新日志
+
+### v1.2.0
+- 新增 KernelSU 模块 WebUI（可视化状态监控、配置编辑、日志查看、快捷操作）
 
 ### v1.1.0
 - 新增 `psi.conf` 运行时配置文件支持

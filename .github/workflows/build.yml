@@ -80,6 +80,7 @@ jobs:
           rm -rf stage && mkdir -p stage
           cp -r module/* stage/
           cp build/psi_recomp stage/psi_recomp
+          # webroot 已包含在 module/* 中，确保权限正确
           chmod 0755 stage/psi_recomp stage/service.sh
           find stage -type f | sort
           echo "--- module size ---"

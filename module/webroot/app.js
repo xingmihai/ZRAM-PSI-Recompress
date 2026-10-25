@@ -1,0 +1,495 @@
+/**
+ * ZRAM PSI Recompress - WebUI App
+ * KernelSU Module WebUI
+ */
+
+import { exec, toast, moduleInfo } from './kernelsu.js';
+
+// ========== 全局状态 ==========
+let moduleDir = '';
+let currentLogType = 'psi';
+let autoRefreshTimer = null;
+
+// ========== 初始化 ==========
+document.addEventListener('DOMContentLoaded', async () => {
+    await init();
+});
+
+async function init() {
+    try {
+        // 获取模块信息
+        const info = moduleInfo();
+        if (info) {
+            const parsed = JSON.parse(info);
+            moduleDir = parsed.moduleDir || '/data/adb/modules/ZRAM-PSI-Recompress';
+            document.getElementById('info-version').textContent = parsed.version || '-';
+            document.getElementById('info-path').textContent = moduleDir;
+        }
+    } catch (e) {
+        moduleDir = '/data/adb/modules/ZRAM-PSI-Recompress';
+    }
+
+    // 加载配置
+    await loadConfig();
+
+    // 刷新状态
+    await refreshStatus();
+    await refreshStats();
+
+    // 自动刷新（每 30 秒）
+    startAutoRefresh();
+}
+
+// ========== 状态刷新 ==========
+async function refreshStatus() {
+    try {
+        // 检查守护进程
+        const { errno: pidErrno, stdout: pidOut } = await exec(
+            `cat ${moduleDir}/psi_recomp.pid 2>/dev/null || echo ""`
+        );
+        const pid = pidOut.trim();
+
+        const daemonEl = document.getElementById('daemon-status');
+        const pidEl = document.getElementById('daemon-pid');
+        const badge = document.getElementById('status-badge');
+
+        if (pid) {
+            // 验证进程是否存活
+            const { errno: aliveErrno } = await exec(`kill -0 ${pid} 2>/dev/null && echo "alive" || echo "dead"`);
+            const isAlive = aliveErrno === 0;
+
+            if (isAlive) {
+                daemonEl.textContent = '运行中';
+                daemonEl.className = 'status-value ok';
+                pidEl.textContent = pid;
+                badge.textContent = '正常';
+                badge.className = 'badge badge-success';
+            } else {
+                daemonEl.textContent = '已停止';
+                daemonEl.className = 'status-value err';
+                pidEl.textContent = pid + ' (僵尸)';
+                badge.textContent = '异常';
+                badge.className = 'badge badge-danger';
+            }
+        } else {
+            daemonEl.textContent = '未运行';
+            daemonEl.className = 'status-value warn';
+            pidEl.textContent = '-';
+            badge.textContent = '未启动';
+            badge.className = 'badge badge-warning';
+        }
+
+        // 读取当前 huge 页数
+        const { errno: hugeErrno, stdout: hugeOut } = await exec(
+            `awk '{print $8}' /sys/block/zram0/mm_stat 2>/dev/null || echo "-1"`
+        );
+        const huge = parseInt(hugeOut.trim());
+        const hugeEl = document.getElementById('current-huge');
+        if (huge >= 0) {
+            hugeEl.textContent = huge.toLocaleString();
+            hugeEl.className = 'status-value';
+        } else {
+            hugeEl.textContent = 'N/A';
+            hugeEl.className = 'status-value err';
+        }
+
+        // 读取阈值（从 psi.conf 或默认值）
+        const { stdout: threshOut } = await exec(
+            `grep "^THRESH_NORMAL=" ${moduleDir}/psi.conf 2>/dev/null | cut -d= -f2 || echo "40000"`
+        );
+        document.getElementById('current-thresh').textContent = parseInt(threshOut.trim()).toLocaleString();
+
+        // PSI 状态
+        const { errno: psiErrno } = await exec(`test -e /proc/pressure/memory && echo "ok" || echo "missing"`);
+        const psiEl = document.getElementById('psi-status');
+        if (psiErrno === 0) {
+            psiEl.textContent = '可用';
+            psiEl.className = 'status-value ok';
+        } else {
+            psiEl.textContent = '不可用';
+            psiEl.className = 'status-value warn';
+        }
+
+        // ZRAM 算法
+        const { stdout: algoOut } = await exec(
+            `cat /sys/block/zram0/comp_algorithm 2>/dev/null | grep -o '\\[.*\\]' | tr -d '[]' || echo "-"`
+        );
+        document.getElementById('zram-algo').textContent = algoOut.trim() || '-';
+
+        // ZRAM 大小
+        const { stdout: sizeOut } = await exec(
+            `cat /sys/block/zram0/disksize 2>/dev/null || echo "0"`
+        );
+        const sizeBytes = parseInt(sizeOut.trim());
+        if (sizeBytes > 0) {
+            const sizeGB = (sizeBytes / 1024 / 1024 / 1024).toFixed(1);
+            document.getElementById('info-zram-size').textContent = sizeGB + ' GB';
+        } else {
+            document.getElementById('info-zram-size').textContent = '-';
+        }
+
+        // ZRAM 算法（配置）
+        const { stdout: cfgAlgoOut } = await exec(
+            `grep "^ZRAM_ALGO=" ${moduleDir}/config.prop 2>/dev/null | cut -d= -f2 || echo "-"`
+        );
+        document.getElementById('info-zram-algo').textContent = cfgAlgoOut.trim() || '-';
+
+    } catch (e) {
+        console.error('refreshStatus error:', e);
+    }
+}
+
+// ========== 统计刷新 ==========
+async function refreshStats() {
+    try {
+        // 从 psi.log 解析统计
+        const { stdout: logOut } = await exec(
+            `tail -50 ${moduleDir}/psi.log 2>/dev/null || echo ""`
+        );
+
+        let checks = 0, compress = 0, saved = 0, peak = 0;
+
+        // 解析 exit 行或 stats 行
+        const statsMatch = logOut.match(/stats: total_comp=(\d+), total_saved=(\d+) pages.*?peak=(\d+)/);
+        const exitMatch = logOut.match(/exit: checks=(\d+) psi_events=(\d+) recompress=(\d+) peak=(\d+) total_saved=(\d+) pages/);
+
+        if (statsMatch) {
+            compress = parseInt(statsMatch[1]);
+            saved = parseInt(statsMatch[2]);
+            peak = parseInt(statsMatch[3]);
+        } else if (exitMatch) {
+            checks = parseInt(exitMatch[1]);
+            compress = parseInt(exitMatch[3]);
+            peak = parseInt(exitMatch[4]);
+            saved = parseInt(exitMatch[5]);
+        }
+
+        // 统计检查次数（从日志行数估算）
+        const { stdout: lineCount } = await exec(
+            `wc -l < ${moduleDir}/psi.log 2>/dev/null || echo "0"`
+        );
+        const totalLines = parseInt(lineCount.trim());
+        checks = Math.max(checks, totalLines);
+
+        // 计算节省 MiB
+        const savedMiB = (saved * 4 / 1024).toFixed(1);
+
+        document.getElementById('stat-checks').textContent = checks.toLocaleString();
+        document.getElementById('stat-compress').textContent = compress.toLocaleString();
+        document.getElementById('stat-saved').textContent = savedMiB;
+        document.getElementById('stat-peak').textContent = peak > 0 ? peak.toLocaleString() : '-';
+
+    } catch (e) {
+        console.error('refreshStats error:', e);
+    }
+}
+
+// ========== 配置管理 ==========
+async function loadConfig() {
+    try {
+        const { stdout } = await exec(`cat ${moduleDir}/psi.conf 2>/dev/null || echo ""`);
+        parseConfig(stdout);
+        showActionResult('配置已加载', 'success');
+    } catch (e) {
+        showActionResult('加载配置失败: ' + e.message, 'error');
+    }
+}
+
+function parseConfig(content) {
+    const lines = content.split('\n');
+    const config = {};
+
+    for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) continue;
+
+        const eqIdx = trimmed.indexOf('=');
+        if (eqIdx < 0) continue;
+
+        const key = trimmed.substring(0, eqIdx).trim();
+        const value = trimmed.substring(eqIdx + 1).trim();
+        config[key] = value;
+    }
+
+    // 填充表单
+    setInputValue('cfg-thresh', config.THRESH_NORMAL);
+    setInputValue('cfg-hyst-sec', config.HYSTERESIS_SEC);
+    setInputValue('cfg-hyst-margin', config.HYST_MARGIN);
+    setInputValue('cfg-min-gap', config.MIN_GAP_SEC);
+    setInputValue('cfg-idle-timeout', config.IDLE_TIMEOUT_MS);
+    setInputValue('cfg-psi-trigger', config.PSI_TRIGGER);
+    setInputValue('cfg-log-max', config.LOG_MAX_LINES);
+    setInputValue('cfg-log-keep', config.LOG_KEEP_LINES);
+    setInputValue('cfg-skip-every', config.SKIP_LOG_EVERY);
+}
+
+function setInputValue(id, value) {
+    const el = document.getElementById(id);
+    if (el && value !== undefined) {
+        el.value = value;
+    }
+}
+
+async function saveConfig() {
+    try {
+        const config = buildConfigFromForm();
+        const content = generateConfigText(config);
+
+        // 写入配置文件
+        const escaped = content.replace(/'/g, "'\\''");
+        const { errno } = await exec(`echo '${escaped}' > ${moduleDir}/psi.conf`);
+
+        if (errno === 0) {
+            showActionResult('配置已保存，重启模块后生效', 'success');
+            toast('配置已保存');
+        } else {
+            showActionResult('保存配置失败', 'error');
+        }
+    } catch (e) {
+        showActionResult('保存配置失败: ' + e.message, 'error');
+    }
+}
+
+function buildConfigFromForm() {
+    return {
+        THRESH_NORMAL: getInputValue('cfg-thresh', '40000'),
+        HYSTERESIS_SEC: getInputValue('cfg-hyst-sec', '5400'),
+        HYST_MARGIN: getInputValue('cfg-hyst-margin', '8000'),
+        MIN_GAP_SEC: getInputValue('cfg-min-gap', '60'),
+        IDLE_TIMEOUT_MS: getInputValue('cfg-idle-timeout', '1800000'),
+        PSI_TRIGGER: getInputValue('cfg-psi-trigger', 'some 15000 1000000'),
+        LOG_MAX_LINES: getInputValue('cfg-log-max', '600'),
+        LOG_KEEP_LINES: getInputValue('cfg-log-keep', '300'),
+        SKIP_LOG_EVERY: getInputValue('cfg-skip-every', '5'),
+    };
+}
+
+function getInputValue(id, defaultVal) {
+    const el = document.getElementById(id);
+    return el && el.value ? el.value : defaultVal;
+}
+
+function generateConfigText(config) {
+    return `# psi_recomp 配置文件
+# 由 WebUI 生成于 ${new Date().toISOString()}
+
+# 常态触发阈值（huge 页数）
+THRESH_NORMAL=${config.THRESH_NORMAL}
+
+# 滞回持续时间（秒）
+HYSTERESIS_SEC=${config.HYSTERESIS_SEC}
+
+# 滞回余量（页数）
+HYST_MARGIN=${config.HYST_MARGIN}
+
+# 两次检查的最小间隔（秒）
+MIN_GAP_SEC=${config.MIN_GAP_SEC}
+
+# 兜底轮询间隔（毫秒）
+IDLE_TIMEOUT_MS=${config.IDLE_TIMEOUT_MS}
+
+# PSI 触发条件
+PSI_TRIGGER=${config.PSI_TRIGGER}
+
+# 日志轮转
+LOG_MAX_LINES=${config.LOG_MAX_LINES}
+LOG_KEEP_LINES=${config.LOG_KEEP_LINES}
+
+# Skip 日志降频
+SKIP_LOG_EVERY=${config.SKIP_LOG_EVERY}
+`;
+}
+
+async function resetConfig() {
+    try {
+        const defaultConfig = `THRESH_NORMAL=40000
+HYSTERESIS_SEC=5400
+HYST_MARGIN=8000
+MIN_GAP_SEC=60
+IDLE_TIMEOUT_MS=1800000
+PSI_TRIGGER=some 15000 1000000
+LOG_MAX_LINES=600
+LOG_KEEP_LINES=300
+SKIP_LOG_EVERY=5`;
+
+        const escaped = defaultConfig.replace(/'/g, "'\\''");
+        const { errno } = await exec(`echo '${escaped}' > ${moduleDir}/psi.conf`);
+
+        if (errno === 0) {
+            parseConfig(defaultConfig);
+            showActionResult('已恢复默认配置', 'success');
+            toast('已恢复默认配置');
+        } else {
+            showActionResult('恢复默认配置失败', 'error');
+        }
+    } catch (e) {
+        showActionResult('恢复默认配置失败: ' + e.message, 'error');
+    }
+}
+
+// ========== 日志管理 ==========
+async function refreshLog() {
+    const viewer = document.getElementById('log-viewer');
+
+    let logFile;
+    switch (currentLogType) {
+        case 'psi': logFile = 'psi.log'; break;
+        case 'module': logFile = 'zram_module.log'; break;
+        case 'recompress': logFile = 'recompress.log'; break;
+        default: logFile = 'psi.log';
+    }
+
+    try {
+        const { stdout } = await exec(`tail -100 ${moduleDir}/${logFile} 2>/dev/null || echo "(日志文件不存在或为空)"`);
+        viewer.textContent = stdout || '(空)';
+        viewer.scrollTop = viewer.scrollHeight;
+    } catch (e) {
+        viewer.textContent = '读取日志失败: ' + e.message;
+    }
+}
+
+function switchLog(type) {
+    currentLogType = type;
+
+    // 更新 tab 样式
+    document.querySelectorAll('.log-tab').forEach(tab => {
+        tab.classList.toggle('active', tab.dataset.log === type);
+    });
+
+    refreshLog();
+}
+
+async function clearLog() {
+    try {
+        let logFile;
+        switch (currentLogType) {
+            case 'psi': logFile = 'psi.log'; break;
+            case 'module': logFile = 'zram_module.log'; break;
+            case 'recompress': logFile = 'recompress.log'; break;
+        }
+
+        await exec(`: > ${moduleDir}/${logFile}`);
+        showActionResult('日志已清空', 'success');
+        refreshLog();
+    } catch (e) {
+        showActionResult('清空日志失败: ' + e.message, 'error');
+    }
+}
+
+// ========== 快捷操作 ==========
+async function triggerRecompress() {
+    try {
+        showActionResult('正在触发重压缩...', 'info');
+
+        const { errno, stdout, stderr } = await exec(
+            `echo "type=huge" > /sys/block/zram0/recompress 2>&1 && echo "OK" || echo "FAIL: $(cat /sys/block/zram0/recompress 2>&1)"`
+        );
+
+        if (errno === 0 && stdout.includes('OK')) {
+            showActionResult('重压缩已触发', 'success');
+            toast('重压缩已触发');
+
+            // 延迟刷新统计
+            setTimeout(async () => {
+                await refreshStats();
+                await refreshStatus();
+            }, 2000);
+        } else {
+            showActionResult('触发失败: ' + (stderr || stdout), 'error');
+        }
+    } catch (e) {
+        showActionResult('触发失败: ' + e.message, 'error');
+    }
+}
+
+async function restartDaemon() {
+    try {
+        showActionResult('正在重启守护进程...', 'info');
+
+        // 停止现有进程
+        await exec(`kill $(cat ${moduleDir}/psi_recomp.pid 2>/dev/null) 2>/dev/null; sleep 1`);
+
+        // 重新启动
+        const { errno } = await exec(
+            `chmod 0755 ${moduleDir}/psi_recomp 2>/dev/null; ` +
+            `setsid ${moduleDir}/psi_recomp ${moduleDir}/psi.log ${moduleDir}/psi.conf &`
+        );
+
+        if (errno === 0) {
+            showActionResult('守护进程已重启', 'success');
+            toast('守护进程已重启');
+
+            setTimeout(async () => {
+                await refreshStatus();
+                await refreshStats();
+            }, 2000);
+        } else {
+            showActionResult('重启失败', 'error');
+        }
+    } catch (e) {
+        showActionResult('重启失败: ' + e.message, 'error');
+    }
+}
+
+async function testPSI() {
+    try {
+        showActionResult('正在测试 PSI...', 'info');
+
+        const { errno, stdout } = await exec(
+            `test -e /proc/pressure/memory && echo "PSI 接口存在" || echo "PSI 接口不存在"; ` +
+            `cat /proc/pressure/memory 2>/dev/null | head -3`
+        );
+
+        if (errno === 0) {
+            showActionResult('PSI 测试结果:\n' + stdout, 'success');
+        } else {
+            showActionResult('PSI 测试失败', 'error');
+        }
+    } catch (e) {
+        showActionResult('PSI 测试失败: ' + e.message, 'error');
+    }
+}
+
+// ========== 工具函数 ==========
+function showActionResult(message, type = 'info') {
+    const el = document.getElementById('action-result');
+    el.textContent = message;
+    el.className = 'action-result ' + type;
+}
+
+function startAutoRefresh() {
+    if (autoRefreshTimer) clearInterval(autoRefreshTimer);
+    autoRefreshTimer = setInterval(async () => {
+        await refreshStatus();
+        await refreshStats();
+    }, 30000);
+}
+
+function stopAutoRefresh() {
+    if (autoRefreshTimer) {
+        clearInterval(autoRefreshTimer);
+        autoRefreshTimer = null;
+    }
+}
+
+// 页面隐藏时停止自动刷新
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+        stopAutoRefresh();
+    } else {
+        startAutoRefresh();
+    }
+});
+
+// 暴露到全局（供 HTML onclick 调用）
+window.refreshStatus = refreshStatus;
+window.refreshStats = refreshStats;
+window.loadConfig = loadConfig;
+window.saveConfig = saveConfig;
+window.resetConfig = resetConfig;
+window.refreshLog = refreshLog;
+window.switchLog = switchLog;
+window.clearLog = clearLog;
+window.triggerRecompress = triggerRecompress;
+window.restartDaemon = restartDaemon;
+window.testPSI = testPSI;
