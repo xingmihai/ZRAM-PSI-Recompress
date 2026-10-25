@@ -78,28 +78,43 @@
             </div>
             <div class="form-group">
                 <label for="cfg-thresh">常态触发阈值（huge 页数）</label>
-                <input type="number" id="cfg-thresh" class="input" placeholder="40000">
+                <div class="slider-row">
+                    <input type="range" id="cfg-thresh" class="slider" min="5000" max="80000" step="1000" value="40000" oninput="updateSliderVal('cfg-thresh')">
+                    <span class="slider-val" id="cfg-thresh-val">40000</span>
+                </div>
                 <div class="input-hint">当 huge 页数超过此值时触发重压缩</div>
             </div>
             <div class="form-group">
-                <label for="cfg-hyst-sec">滞回持续时间（秒）</label>
-                <input type="number" id="cfg-hyst-sec" class="input" placeholder="5400">
+                <label for="cfg-hyst-sec">滞回持续时间</label>
+                <div class="slider-row">
+                    <input type="range" id="cfg-hyst-sec" class="slider" min="0" max="10800" step="300" value="5400" oninput="updateSliderVal('cfg-hyst-sec')">
+                    <span class="slider-val" id="cfg-hyst-sec-val">90 分钟</span>
+                </div>
                 <div class="input-hint">刚压完后的这段时间内提高阈值，避免空压</div>
             </div>
             <div class="form-group">
                 <label for="cfg-hyst-margin">滞回余量（页数）</label>
-                <input type="number" id="cfg-hyst-margin" class="input" placeholder="8000">
+                <div class="slider-row">
+                    <input type="range" id="cfg-hyst-margin" class="slider" min="0" max="40000" step="500" value="8000" oninput="updateSliderVal('cfg-hyst-margin')">
+                    <span class="slider-val" id="cfg-hyst-margin-val">8000</span>
+                </div>
                 <div class="input-hint">滞回期间阈值 = 上次残留 + 此值</div>
             </div>
             <div class="form-group">
-                <label for="cfg-min-gap">最小检查间隔（秒）</label>
-                <input type="number" id="cfg-min-gap" class="input" placeholder="60">
+                <label for="cfg-min-gap">最小检查间隔</label>
+                <div class="slider-row">
+                    <input type="range" id="cfg-min-gap" class="slider" min="10" max="600" step="10" value="60" oninput="updateSliderVal('cfg-min-gap')">
+                    <span class="slider-val" id="cfg-min-gap-val">60 秒</span>
+                </div>
                 <div class="input-hint">防止 PSI 风暴导致检查过于频繁</div>
             </div>
             <div class="form-group">
-                <label for="cfg-idle-timeout">兜底轮询间隔（毫秒）</label>
-                <input type="number" id="cfg-idle-timeout" class="input" placeholder="1800000">
-                <div class="input-hint">PSI 无事件时最多等待这么久再检查</div>
+                <label for="cfg-idle-timeout">兜底轮询间隔</label>
+                <div class="slider-row">
+                    <input type="range" id="cfg-idle-timeout" class="slider" min="60" max="3600" step="60" value="1800" oninput="updateSliderVal('cfg-idle-timeout')">
+                    <span class="slider-val" id="cfg-idle-timeout-val">30 分钟</span>
+                </div>
+                <div class="input-hint">PSI 无事件时最多等待这么久再检查（单位：秒）</div>
             </div>
             <div class="form-group">
                 <label for="cfg-psi-trigger">PSI 触发条件</label>
@@ -108,15 +123,24 @@
             </div>
             <div class="form-group">
                 <label for="cfg-log-max">日志最大行数</label>
-                <input type="number" id="cfg-log-max" class="input" placeholder="600">
+                <div class="slider-row">
+                    <input type="range" id="cfg-log-max" class="slider" min="50" max="2000" step="50" value="600" oninput="updateSliderVal('cfg-log-max')">
+                    <span class="slider-val" id="cfg-log-max-val">600</span>
+                </div>
             </div>
             <div class="form-group">
                 <label for="cfg-log-keep">日志保留行数</label>
-                <input type="number" id="cfg-log-keep" class="input" placeholder="300">
+                <div class="slider-row">
+                    <input type="range" id="cfg-log-keep" class="slider" min="10" max="1000" step="10" value="300" oninput="updateSliderVal('cfg-log-keep')">
+                    <span class="slider-val" id="cfg-log-keep-val">300</span>
+                </div>
             </div>
             <div class="form-group">
                 <label for="cfg-skip-every">Skip 日志降频</label>
-                <input type="number" id="cfg-skip-every" class="input" placeholder="5">
+                <div class="slider-row">
+                    <input type="range" id="cfg-skip-every" class="slider" min="1" max="20" step="1" value="5" oninput="updateSliderVal('cfg-skip-every')">
+                    <span class="slider-val" id="cfg-skip-every-val">5</span>
+                </div>
                 <div class="input-hint">连续 skip 时每 N 次记录一行</div>
             </div>
             <div class="btn-group">
