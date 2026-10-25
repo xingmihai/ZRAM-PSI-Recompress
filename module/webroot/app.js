@@ -160,6 +160,7 @@ function parseStatsFile(content) {
 async function refreshStats() {
     try {
         let checks = 0, psiEvents = 0, compress = 0, saved = 0, peak = 0, huge = -1;
+        let lastComp = 0;
 
         /*
          * 优先读取守护进程实时写入的 psi_stats。
@@ -179,6 +180,7 @@ async function refreshStats() {
             peak = parseInt(st.peak) || 0;
             saved = parseInt(st.total_saved) || 0;
             huge = parseInt(st.huge);
+            lastComp = parseInt(st.last_comp) || 0;
         } else {
             /* 回退：老版本守护进程没有状态文件，仍解析日志 */
             const { stdout: logOut } = await exec(
@@ -226,8 +228,25 @@ async function refreshStats() {
                 ? throttled.toLocaleString() + ' 次'
                 : (checks > 0 ? '0' : '-');
         }
-        const hugeEl = document.getElementById('stat-huge');
-        if (hugeEl) hugeEl.textContent = huge >= 0 ? huge.toLocaleString() : '-';
+
+        /*
+         * 「当前 huge」在「运行状态」卡片里已有实时读取的版本
+         * （直接读 /sys/block/zram0/mm_stat），此处不再重复显示
+         * psi_stats 里的快照值，改为展示更有用的「距上次压缩」。
+         */
+        const lastCompEl = document.getElementById('stat-last-comp');
+        if (lastCompEl) {
+            if (lastComp > 0) {
+                const diff = Math.floor(Date.now() / 1000) - lastComp;
+                let txt;
+                if (diff < 60) txt = diff + ' 秒前';
+                else if (diff < 3600) txt = Math.floor(diff / 60) + ' 分钟前';
+                else txt = (diff / 3600).toFixed(1) + ' 小时前';
+                lastCompEl.textContent = txt;
+            } else {
+                lastCompEl.textContent = compress > 0 ? '-' : '从未';
+            }
+        }
 
     } catch (e) {
         console.error('refreshStats error:', e);
