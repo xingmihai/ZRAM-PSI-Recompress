@@ -29,6 +29,9 @@ async function init() {
         moduleDir = '/data/adb/modules/ZRAM-PSI-Recompress';
     }
 
+    // 初始化滑块（绑定事件 + 数值气泡）
+    initSliders();
+
     // 加载配置
     await loadConfig();
 
@@ -184,6 +187,55 @@ async function refreshStats() {
     }
 }
 
+
+// ========== 滑块辅助（v1.2.1） ==========
+
+/* 滑块显示格式化：不同参数用不同单位 */
+function formatSliderVal(id, v) {
+    switch (id) {
+        case 'cfg-hyst-sec':
+        case 'cfg-idle-timeout': {
+            const sec = Number(v);
+            if (sec === 0) return '关闭';
+            if (sec < 60) return sec + ' 秒';
+            const m = sec / 60;
+            return (Number.isInteger(m) ? m : m.toFixed(1)) + ' 分钟';
+        }
+        case 'cfg-min-gap':
+            return Number(v) + ' 秒';
+        case 'cfg-skip-every':
+            return '每 ' + Number(v) + ' 次';
+        default:
+            return Number(v).toLocaleString();
+    }
+}
+
+/* 实时更新滑块数值气泡 + 已填充进度色 */
+function updateSliderVal(id) {
+    const el = document.getElementById(id);
+    const valEl = document.getElementById(id + '-val');
+    if (!el || !valEl) return;
+    valEl.textContent = formatSliderVal(id, el.value);
+
+    const min = Number(el.min) || 0;
+    const max = Number(el.max) || 100;
+    const pct = ((Number(el.value) - min) / (max - min)) * 100;
+    el.style.background =
+        'linear-gradient(90deg, #4a9eff 0%, #4a9eff ' + pct + '%, #2a2f3a ' + pct + '%, #2a2f3a 100%)';
+}
+
+/* 页面加载后为所有滑块绑定事件并初始化显示 */
+function initSliders() {
+    const ids = ['cfg-thresh', 'cfg-hyst-sec', 'cfg-hyst-margin', 'cfg-min-gap',
+                 'cfg-idle-timeout', 'cfg-log-max', 'cfg-log-keep', 'cfg-skip-every'];
+    ids.forEach(id => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.addEventListener('input', () => updateSliderVal(id));
+        updateSliderVal(id);
+    });
+}
+
 // ========== 配置管理 ==========
 async function loadConfig() {
     try {
@@ -225,9 +277,17 @@ function parseConfig(content) {
 
 function setInputValue(id, value) {
     const el = document.getElementById(id);
-    if (el && value !== undefined) {
-        el.value = value;
+    if (!el || value === undefined) return;
+
+    /* IDLE_TIMEOUT_MS 在配置文件里是毫秒，滑块用秒显示 */
+    let v = value;
+    if (id === 'cfg-idle-timeout') {
+        v = Math.round(Number(value) / 1000);
     }
+    el.value = v;
+
+    /* range 需要同步数值气泡和进度色 */
+    if (el.type === 'range') updateSliderVal(id);
 }
 
 async function saveConfig() {
@@ -256,7 +316,8 @@ function buildConfigFromForm() {
         HYSTERESIS_SEC: getInputValue('cfg-hyst-sec', '5400'),
         HYST_MARGIN: getInputValue('cfg-hyst-margin', '8000'),
         MIN_GAP_SEC: getInputValue('cfg-min-gap', '60'),
-        IDLE_TIMEOUT_MS: getInputValue('cfg-idle-timeout', '1800000'),
+        /* 滑块单位是秒，配置里是毫秒 */
+        IDLE_TIMEOUT_MS: String(Number(getInputValue('cfg-idle-timeout', '1800')) * 1000),
         PSI_TRIGGER: getInputValue('cfg-psi-trigger', 'some 15000 1000000'),
         LOG_MAX_LINES: getInputValue('cfg-log-max', '600'),
         LOG_KEEP_LINES: getInputValue('cfg-log-keep', '300'),
@@ -410,12 +471,26 @@ async function restartDaemon() {
         await exec(`kill $(cat ${moduleDir}/psi_recomp.pid 2>/dev/null) 2>/dev/null; sleep 1`);
 
         // 重新启动
-        const { errno } = await exec(
+        await exec(
             `chmod 0755 ${moduleDir}/psi_recomp 2>/dev/null; ` +
             `setsid ${moduleDir}/psi_recomp ${moduleDir}/psi.log ${moduleDir}/psi.conf &`
         );
 
-        if (errno === 0) {
+        /* `cmd &` 的退出码恒为 0，无法判断是否真的起来了，
+           必须等一小会儿后用 ps 实际检测进程。
+           同时重写 PID 文件：旧进程退出时可能删掉新进程写的 PID。 */
+        await new Promise(r => setTimeout(r, 1500));
+        const { stdout: psOut } = await exec(
+            `ps -A 2>/dev/null | grep -c "[p]si_recomp" || echo 0`
+        );
+        const alive = parseInt(psOut.trim()) > 0;
+        if (alive) {
+            await exec(`${moduleDir}/psi_recomp --pid 2>/dev/null; true`);
+            const { stdout: p } = await exec(`ps -A 2>/dev/null | grep "[p]si_recomp" | awk '{print $2}' | head -1`);
+            if (p.trim()) await exec(`echo ${p.trim()} > ${moduleDir}/psi_recomp.pid`);
+        }
+
+        if (alive) {
             showActionResult('守护进程已重启', 'success');
             toast('守护进程已重启');
 
