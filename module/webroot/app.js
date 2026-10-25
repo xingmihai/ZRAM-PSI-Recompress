@@ -174,6 +174,7 @@ async function refreshStats() {
         if (st.checks !== undefined) {
             checks = parseInt(st.checks) || 0;
             psiEvents = parseInt(st.psi_events) || 0;
+            const throttled = parseInt(st.psi_throttled) || 0;
             compress = parseInt(st.recompress) || 0;
             peak = parseInt(st.peak) || 0;
             saved = parseInt(st.total_saved) || 0;
@@ -213,9 +214,17 @@ async function refreshStats() {
         /* 有 psi_events 字段时顺带展示 PSI 事件占比 */
         const psiEl = document.getElementById('stat-psi-events');
         if (psiEl) {
+            /* psi_events 恒 <= checks，占比不会超过 100% */
+            const pct = checks > 0 ? Math.min(100, Math.round(psiEvents / checks * 100)) : 0;
             psiEl.textContent = checks > 0
-                ? psiEvents.toLocaleString() + ' (' + Math.round(psiEvents / checks * 100) + '%)'
+                ? psiEvents.toLocaleString() + ' / ' + checks.toLocaleString() + ' (' + pct + '%)'
                 : '-';
+        }
+        const thrEl = document.getElementById('stat-throttled');
+        if (thrEl) {
+            thrEl.textContent = throttled > 0
+                ? throttled.toLocaleString() + ' 次'
+                : (checks > 0 ? '0' : '-');
         }
         const hugeEl = document.getElementById('stat-huge');
         if (hugeEl) hugeEl.textContent = huge >= 0 ? huge.toLocaleString() : '-';
