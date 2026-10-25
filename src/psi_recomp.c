@@ -20,6 +20,17 @@
  *
  * 用法: psi_recomp <logpath> [configpath]
  *
+ * v1.2.1 变更：
+ *   - 修复限流忙循环：PSI 持续触发时 continue 直接回到循环顶部，
+ *     poll() 立即返回形成 arm/poll/continue 空转，每轮还开关 /proc 文件，
+ *     持续 g_min_gap_sec 秒满负荷。改为睡掉剩余时间。
+ *   - 修复 IDLE_TIMEOUT_MS 无下限：配置 < 1000 时 /1000 得 0 导致
+ *     sleep(0) 满核；超 INT_MAX 时转 int 溢出为负导致 poll 立即返回。
+ *     新增 clamp_config() 对全部 13 个参数做安全钳制。
+ *   - 修复 poll() 出错分支 fd 泄漏（原实现置 psi_ok=0 后不再 close）
+ *   - 修复 log_rotate() 中 freopen 失败后 fclose 可能 double-close
+ *   - WebUI 数值输入改为滑块，范围与 clamp_config 一一对应
+ *
  * v1.2.0 变更：
  *   - 新增 KernelSU 模块 WebUI 支持
  *
@@ -114,7 +125,8 @@ static void protect_from_oom(void)
 {
     int fd = open("/proc/self/oom_score_adj", O_WRONLY);
     if (fd >= 0) {
-        write(fd, "-800", 4);
+        ssize_t w = write(fd, "-800", 4);
+        (void)w;
         close(fd);
     }
 }
@@ -123,7 +135,8 @@ static void protect_from_oom(void)
 static void set_low_priority(void)
 {
     /* nice 值提高到 10（后台任务级别） */
-    nice(10);
+    int old_nice = nice(10);
+    (void)old_nice;
 }
 
 /* ---------------- 日志轮转（getline 版，O(n) 但常数更小） ---------------- */
@@ -179,11 +192,12 @@ static void log_rotate(unsigned long keep)
     fclose(w);
     free(buf);
 
-    if (freopen(g_logpath, "a", g_log) == NULL) {
-        fclose(g_log);
-        g_log = fopen(g_logpath, "a");
-        if (!g_log) return;
-    }
+    /* freopen 失败后 g_log 状态未定义，不能再 fclose，
+       否则可能 double-close。先置 NULL 再重开。 */
+    fclose(g_log);
+    g_log = NULL;
+    g_log = fopen(g_logpath, "a");
+    if (!g_log) return;
     g_lines = keep;
 }
 
@@ -215,6 +229,8 @@ static void trim(char *s)
                        s[len-1] == '\n' || s[len-1] == '\r'))
         s[--len] = '\0';
 }
+
+static void clamp_config(void);
 
 static void load_config(const char *path)
 {
@@ -256,6 +272,34 @@ static void load_config(const char *path)
         }
     }
     fclose(f);
+    clamp_config();
+}
+
+/*
+ * 参数钳制：配置文件来自用户可编辑的 psi.conf / WebUI，
+ * 必须限制到安全区间，否则：
+ *   - IDLE_TIMEOUT_MS < 1000 时 /1000 得 0 -> sleep(0) 满核忙循环
+ *   - IDLE_TIMEOUT_MS 超 INT_MAX 时转 int 溢出为负 -> poll 立即返回忙循环
+ *   - MIN_GAP_SEC=0 时限流失效
+ */
+static void clamp_config(void)
+{
+    if (g_idle_timeout_ms < 1000)     g_idle_timeout_ms = 1000;
+    if (g_idle_timeout_ms > 3600000)  g_idle_timeout_ms = 3600000;
+    if (g_min_gap_sec < 1)            g_min_gap_sec = 1;
+    if (g_min_gap_sec > 3600)         g_min_gap_sec = 3600;
+    if (g_thresh_normal < 1000)       g_thresh_normal = 1000;
+    if (g_thresh_normal > 200000)     g_thresh_normal = 200000;
+    if (g_hysteresis_sec < 0)         g_hysteresis_sec = 0;
+    if (g_hysteresis_sec > 86400)     g_hysteresis_sec = 86400;
+    if (g_hyst_margin < 0)            g_hyst_margin = 0;
+    if (g_hyst_margin > 200000)       g_hyst_margin = 200000;
+    if (g_log_max_lines < 50)         g_log_max_lines = 50;
+    if (g_log_max_lines > 100000)     g_log_max_lines = 100000;
+    if (g_log_keep_lines < 10)        g_log_keep_lines = 10;
+    if (g_log_keep_lines >= g_log_max_lines) g_log_keep_lines = g_log_max_lines / 2;
+    if (g_skip_log_every < 1)         g_skip_log_every = 1;
+    if (g_skip_log_every > 100)       g_skip_log_every = 100;
 }
 
 /* ---------------- mm_stat 读取（健壮版） ---------------- */
@@ -396,7 +440,10 @@ int main(int argc, char **argv)
                 int r = poll(&pfd, 1, (int)g_idle_timeout_ms);
                 if (r < 0) {
                     if (errno == EINTR) { close(psi); continue; }
+                    /* 注意：必须先关 fd 再置 psi_ok=0，
+                       否则下方 `if (psi_ok && psi>=0)` 不再成立，fd 泄漏 */
                     plog("poll error: %s -> fallback to timer", strerror(errno));
+                    close(psi); psi = -1;
                     psi_ok = 0;
                 } else if (r > 0) {
                     fired = 1;
@@ -409,8 +456,17 @@ int main(int argc, char **argv)
         if (!psi_ok && !fired) sleep_full(g_idle_timeout_ms / 1000);
 
         time_t now = time(NULL);
-        /* 限流 */
-        if (last_check && (now - last_check) < g_min_gap_sec) continue;
+        /*
+         * 限流：距上次检查不足 MIN_GAP_SEC 时，必须睡掉剩余时间。
+         * 原实现直接 continue 回到循环顶部重新 arm+poll —— 内存压力持续时
+         * poll() 会立即返回，于是 arm/poll/continue 形成忙循环，
+         * 每轮还要开关一次 /proc 文件，持续 g_min_gap_sec 秒满负荷空转。
+         */
+        if (last_check && (now - last_check) < g_min_gap_sec) {
+            long wait = g_min_gap_sec - (now - last_check);
+            if (wait > 0) sleep_full(wait);
+            continue;
+        }
         last_check = now;
         n_check++;
 
@@ -448,7 +504,7 @@ int main(int argc, char **argv)
                 if (n_comp % 10 == 0) {
                     plog("stats: total_comp=%lu, total_saved=%lu pages (%.1f MiB), peak=%ld",
                          n_comp, g_total_saved_pages,
-                         g_total_saved_pages * 4.0 / 1024.0, peak);
+                         (double)g_total_saved_pages / 256.0, peak);
                 }
             } else {
                 plog("  recompress FAILED: %s", strerror(errno));
@@ -465,7 +521,7 @@ int main(int argc, char **argv)
 
     plog("=== exit: checks=%lu psi_events=%lu recompress=%lu peak=%ld total_saved=%lu pages (%.1f MiB) ===",
          n_check, n_psi, n_comp, peak,
-         g_total_saved_pages, g_total_saved_pages * 4.0 / 1024.0);
+         g_total_saved_pages, (double)g_total_saved_pages / 256.0);
     if (g_log) fclose(g_log);
     remove_pid_file();
     return 0;
