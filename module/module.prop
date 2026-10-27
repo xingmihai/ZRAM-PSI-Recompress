@@ -1,6 +1,6 @@
 id=ZRAM-PSI-Recompress
 name=ZRAM PSI 重压缩守护
-version=v1.2.6
-versionCode=126
+version=v1.3.0
+versionCode=130
 author=psi_recomp
 description=基于 PSI 事件驱动的 zram huge 页重压缩，带滞回、定时兜底、运行时配置、WebUI
