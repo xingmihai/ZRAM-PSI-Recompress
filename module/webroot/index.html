@@ -82,6 +82,61 @@
             </div>
         </div>
 
+        <!-- ZRAM 配置 -->
+        <div class="card" id="zram-card">
+            <div class="card-header">
+                <span class="card-title">ZRAM 配置</span>
+                <span class="badge badge-info">即时生效</span>
+            </div>
+
+            <div class="form-group">
+                <label for="cfg-recomp1">重压缩一级算法</label>
+                <select id="cfg-recomp1" class="input"><option>加载中...</option></select>
+                <div class="input-hint">优先尝试的算法，压不动的页交给二级</div>
+            </div>
+
+            <div class="form-group">
+                <label for="cfg-recomp2">重压缩二级算法</label>
+                <select id="cfg-recomp2" class="input"><option>加载中...</option></select>
+                <div class="input-hint">处理一级残留的页，当前内核推荐 zstdn_o</div>
+            </div>
+
+            <div class="form-group">
+                <button class="btn btn-primary" onclick="applyRecompAlgo()">应用重压缩算法</button>
+                <div class="input-hint">无需重建 swap，内存中数据不受影响</div>
+            </div>
+
+            <div class="divider"></div>
+
+            <div class="form-group">
+                <label for="cfg-algo">主压缩算法</label>
+                <select id="cfg-algo" class="input"><option>加载中...</option></select>
+                <div class="input-hint">换入时使用的压缩算法，影响换页速度</div>
+            </div>
+
+            <div class="form-group">
+                <label for="cfg-size">ZRAM 大小</label>
+                <select id="cfg-size" class="input">
+                    <option value="2147483648">2 GB</option>
+                    <option value="4294967296">4 GB</option>
+                    <option value="6442450944">6 GB</option>
+                    <option value="8589934592">8 GB</option>
+                    <option value="12884901888">12 GB</option>
+                    <option value="17179869184">16 GB</option>
+                    <option value="25769803776">24 GB</option>
+                </select>
+                <div class="input-hint">压缩前容量上限，非实际物理占用</div>
+            </div>
+
+            <div class="form-group">
+                <button class="btn btn-danger" onclick="applyZramDevice()">应用主算法与大小（需重建）</button>
+                <div class="input-hint" id="swapoff-warn" style="color:#e74c3c">
+                    会 swapoff 后重建：已换出的页需读回内存，期间明显卡顿，
+                    内存不足时可能杀后台甚至卡死。应用前会自动检查可用内存。
+                </div>
+            </div>
+        </div>
+
         <!-- 参数配置 -->
         <div class="card" id="config-card">
             <div class="card-header">
