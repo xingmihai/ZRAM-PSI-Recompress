@@ -17,7 +17,7 @@ let autoRefreshTimer = null;
  * 由 app.js 实时读取、永远显示最新 —— 无法据此判断页面是否新鲜。
  * 页面上显示此标记，与仓库当前值比对即可确认。
  */
-const WEBUI_BUILD = 8;
+const WEBUI_BUILD = 9;
 
 // ========== 初始化 ==========
 document.addEventListener('DOMContentLoaded', async () => {
@@ -42,6 +42,9 @@ async function init() {
 
     // 初始化滑块（绑定事件 + 数值气泡）
     initSliders();
+
+    // 页面版本自检（HTML 是否被 WebView 缓存住）
+    checkPageFreshness();
 
     // 加载配置
     await loadConfig();
@@ -152,6 +155,36 @@ async function refreshStatus() {
     } catch (e) {
         console.error('refreshStatus error:', e);
     }
+}
+
+// ========== 页面版本自检 ==========
+
+/*
+ * KernelSU WebView 会缓存 index.html，刷了新模块后页面可能仍是旧版。
+ * 旧版 HTML 缺少新版新增的 DOM（apply 日志 tab、弹窗、构建标记行），
+ * 表现为「功能能跑但界面缺东西」，极难定位。
+ *
+ * 逐个检查这些标记元素，缺失则说明 HTML 是缓存的旧版，
+ * 直接提示清缓存，而不是让用户自己猜。
+ */
+function checkPageFreshness() {
+    const marks = [
+        ['modal-mask', '确认弹窗（v1.3.1）'],
+        ['info-build', '构建标记行（v1.3.2）'],
+    ];
+    const missing = marks.filter(([id]) => !document.getElementById(id))
+                         .map(([, d]) => d);
+    const applyTab = document.querySelector('.log-tab[data-log="apply"]');
+    if (!applyTab) missing.push('apply 日志 tab（v1.3.1）');
+
+    if (missing.length) {
+        const msg = `当前页面是旧版缓存，缺少：${missing.join('、')}。\n` +
+                    `请在 KernelSU 管理器中清除应用数据，或重启手机后重开。`;
+        toast(msg, -1);
+        console.warn('[ZRAM] WebUI 页面疑似旧版缓存:', missing);
+        return false;
+    }
+    return true;
 }
 
 // ========== 弹窗 ==========
@@ -283,8 +316,26 @@ async function applyRecompAlgo() {
         await exec(`sed -i 's/^RECOMP_ALGO2=.*/RECOMP_ALGO2=${a2}/' ${moduleDir}/config.prop 2>/dev/null; ` +
                    `grep -q '^RECOMP_ALGO2=' ${moduleDir}/config.prop || echo 'RECOMP_ALGO2=${a2}' >> ${moduleDir}/config.prop`);
 
-        if (ok1 && ok2) toast(`已应用：一级 ${a1} / 二级 ${a2}`);
-        else toast(`部分失败 1:${ok1 ? 'ok' : '失败'} 2:${ok2 ? 'ok' : '失败'}`, -1);
+        if (ok1 && ok2) {
+            toast(`已应用：一级 ${a1} / 二级 ${a2}`);
+        } else {
+            /*
+             * 运行时（zram 已初始化并 swapon）无法变更 recomp_algorithm，
+             * 实测 rc=1。此时不能只报"失败"了事 —— 需明确告知
+             * 必须重建 zram，并给出直接重建的入口。
+             */
+            const go = await showConfirm(
+                '需重建才能生效',
+                `运行时无法直接修改重压缩算法（rc≠0）。\n\n` +
+                `zram 设备一旦初始化（disksize>0 并 swapon）就不再接受\n` +
+                `recomp_algorithm 变更，必须 swapoff 重建。\n\n` +
+                `目标：一级 ${a1} / 二级 ${a2}\n` +
+                `重建需读回已换出数据，过程会卡顿。是否立即重建？`,
+                '立即重建'
+            );
+            if (go) await applyZramDevice();
+            else toast('已取消，算法未变更', -1);
+        }
         await refreshStatus();
     } catch (e) {
         toast('应用失败', -1);
@@ -352,30 +403,48 @@ async function applyZramDevice() {
         await exec(`: > ${LOG}`);
         await exec(`echo "$(date '+%F %H:%M:%S') apply algo=${algo} size=${size}" >> ${LOG}`);
 
+        /*
+         * 顺序必须与 service.sh 一致：
+         * recomp_algorithm 只能在 zram 未初始化（disksize=0）时写入。
+         * 实测把它放在 disksize/swapon 之后会 rc=1 失败 ——
+         * 设备一旦初始化就不再接受重压缩算法变更。
+         * 故 recomp 必须排在 disksize 之前。
+         */
         const steps = [
             ['swapoff',      `swapoff /dev/block/zram0 2>&1`],
             ['reset',        `echo 1 > /sys/block/zram0/reset 2>&1`],
-            ['disksize0',    `echo 0 > /sys/block/zram0/disksize 2>&1`],
+            /* reset 后 disksize 已为 0，再写 0 可能返回 EINVAL，属可容忍 */
+            ['disksize0',    `echo 0 > /sys/block/zram0/disksize 2>&1`, true],
             ['streams',      `echo 8 > /sys/block/zram0/max_comp_streams 2>&1`],
             ['comp_algo',    `echo '${algo}' > /sys/block/zram0/comp_algorithm 2>&1`],
+            ['recomp1',      `echo "algo=${a1} priority=1" > /sys/block/zram0/recomp_algorithm 2>&1`],
+            ['recomp2',      `echo "algo=${a2} priority=2" > /sys/block/zram0/recomp_algorithm 2>&1`],
             ['disksize',     `echo '${size}' > /sys/block/zram0/disksize 2>&1`],
             ['mkswap',       `mkswap /dev/block/zram0 2>&1`],
             ['swapon',       `swapon /dev/block/zram0 2>&1`],
-            ['recomp1',      `echo "algo=${a1} priority=1" > /sys/block/zram0/recomp_algorithm 2>&1`],
-            ['recomp2',      `echo "algo=${a2} priority=2" > /sys/block/zram0/recomp_algorithm 2>&1`],
         ];
 
         let failed = [];
-        for (const [name, cmd] of steps) {
+        let tolerant = [];
+        for (const [name, cmd, canFail] of steps) {
             const { errno, stdout, stderr } = await exec(`${cmd}; echo "rc=$?"`);
             const rc = (stdout || '').match(/rc=(\d+)/);
             const code = rc ? parseInt(rc[1]) : -1;
             const out = ((stdout || '') + (stderr || '')).replace(/rc=\d+/, '').trim();
-            await exec(`echo "[${name}] rc=${code} ${out}" >> ${LOG}`);
-            if (code !== 0) failed.push(`${name}(rc=${code})`);
-            /* 每步之间留一点间隔，避免 sysfs 连续写入过快 */
+            await exec(`echo "[${name}] rc=${code}${canFail ? ' (可容忍)' : ''} ${out}" >> ${LOG}`);
+            if (code !== 0) {
+                if (canFail) tolerant.push(`${name}(rc=${code})`);
+                else failed.push(`${name}(rc=${code})`);
+            }
+            /* reset 后需给内核一点时间完成设备回收 */
             if (name === 'reset') await exec(`sleep 1`);
         }
+
+        /* 复核重压缩算法是否真正生效 */
+        const { stdout: rcNow } = await exec(`cat /sys/block/zram0/recomp_algorithm 2>&1`);
+        await exec(`echo "--- recomp_algorithm ---" >> ${LOG}`);
+        await exec(`echo "${rcNow.trim().replace(/"/g, "'")}" >> ${LOG}`);
+        const recompOk = /\bzstdn\b|\bzstdn_o\b|\blz4\b|\blzo\b|\bzstd\b/.test(rcNow);
 
         // 写回 config.prop
         await exec(`sed -i 's/^ZRAM_ALGO=.*/ZRAM_ALGO=${algo}/' ${moduleDir}/config.prop 2>/dev/null`);
@@ -383,6 +452,10 @@ async function applyZramDevice() {
 
         if (failed.length) {
             toast(`部分步骤失败：${failed.join(', ')}，详见 zram_apply.log`, -1);
+        } else if (!recompOk) {
+            toast(`已重建，但重压缩算法未生效（recomp_algorithm 为空）——重压缩将无效`, -1);
+        } else if (tolerant.length) {
+            toast(`已重建：${algo} / ${sizeGB} GB（${tolerant.join(', ')} 失败，不影响）`);
         } else {
             toast(`已重建：${algo} / ${sizeGB} GB`);
         }
