@@ -41,11 +41,14 @@ echo '0' > /sys/block/zram0/disksize
 echo '8' > /sys/block/zram0/max_comp_streams
 echo "${ZRAM_ALGO}" > /sys/block/zram0/comp_algorithm
 
-# 两级重压缩：zstdn 压不动的页交给 zstdn_o
-echo "algo=zstdn priority=1" > /sys/block/zram0/recomp_algorithm
-echo "recomp p1(zstdn) rc=$?" >> "$LOG"
-echo "algo=zstdn_o priority=2" > /sys/block/zram0/recomp_algorithm
-echo "recomp p2(zstdn_o) rc=$?" >> "$LOG"
+# 两级重压缩：一级压不动的页交给二级
+# 算法名从 config.prop 读取（WebUI 可改），缺省回退到 zstdn / zstdn_o
+RECOMP_ALGO1="${RECOMP_ALGO1:-zstdn}"
+RECOMP_ALGO2="${RECOMP_ALGO2:-zstdn_o}"
+echo "algo=${RECOMP_ALGO1} priority=1" > /sys/block/zram0/recomp_algorithm
+echo "recomp p1(${RECOMP_ALGO1}) rc=$?" >> "$LOG"
+echo "algo=${RECOMP_ALGO2} priority=2" > /sys/block/zram0/recomp_algorithm
+echo "recomp p2(${RECOMP_ALGO2}) rc=$?" >> "$LOG"
 
 echo "${ZRAM_SIZE}" > /sys/block/zram0/disksize
 mkswap /dev/block/zram0 > /dev/null 2>&1
