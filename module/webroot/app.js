@@ -34,6 +34,7 @@ async function init() {
 
     // 加载配置
     await loadConfig();
+    await loadZramOptions();
 
     // 刷新状态
     await refreshStatus();
@@ -139,6 +140,185 @@ async function refreshStatus() {
 
     } catch (e) {
         console.error('refreshStatus error:', e);
+    }
+}
+
+// ========== ZRAM 配置 ==========
+
+/*
+ * 从内核接口抓取算法列表。
+ * comp_algorithm 形如：
+ *   lzo lzo-rle lz4 zstd lz4k lz4kd zstdn zstdn_o [lz4kd]
+ * 方括号标记当前选中项，需剥离。
+ * recomp_algorithm 形如两行 "#1: ..." "#2: ..."。
+ * 抓取而非写死，避免列出内核实际不支持的算法。
+ */
+function parseAlgoList(raw) {
+    if (!raw) return [];
+    const cleaned = raw.replace(/\[|\]/g, ' ');
+    return cleaned.split(/\s+/).map(x => x.trim())
+                  /* 剔除 recomp_algorithm 每行的 "#1:" / "#2:" 序号标记 */
+                  .filter(x => x && x !== '#' && !/^#?\d+:$/.test(x));
+}
+
+async function loadZramOptions() {
+    try {
+        // 主算法
+        const { stdout: compRaw } = await exec(
+            `cat /sys/block/zram0/comp_algorithm 2>/dev/null || echo ""`
+        );
+        const compList = parseAlgoList(compRaw.trim());
+        // 重压缩算法（与 comp 列表在 Oplus 内核上基本一致，但以 recomp 接口为准更可靠）
+        const { stdout: recompRaw } = await exec(
+            `cat /sys/block/zram0/recomp_algorithm 2>/dev/null || echo ""`
+        );
+        const recompList = parseAlgoList(recompRaw.trim());
+        const rList = recompList.length ? [...new Set([...compList, ...recompList])] : compList;
+
+        const fill = (id, list) => {
+            const el = document.getElementById(id);
+            if (!el || !list.length) return;
+            el.innerHTML = list.map(a => `<option value="${a}">${a}</option>`).join('');
+        };
+        fill('cfg-algo', compList);
+        fill('cfg-recomp1', rList);
+        fill('cfg-recomp2', rList);
+
+        // 当前主算法（方括号内）
+        const curM = compRaw.match(/\[([^\]]+)\]/);
+        if (curM) document.getElementById('cfg-algo').value = curM[1];
+
+        // 当前重压缩一/二级：从 recomp_algorithm 各行的方括号提取
+        const lines = recompRaw.trim().split('\n');
+        const cur = lines.map(l => { const m = l.match(/\[([^\]]+)\]/); return m ? m[1] : ''; });
+        if (cur[0]) document.getElementById('cfg-recomp1').value = cur[0];
+        if (cur[1]) document.getElementById('cfg-recomp2').value = cur[1];
+
+        // 当前大小
+        const { stdout: sizeRaw } = await exec(
+            `cat /sys/block/zram0/disksize 2>/dev/null || echo "0"`
+        );
+        const sz = parseInt(sizeRaw.trim()) || 0;
+        const sizeEl = document.getElementById('cfg-size');
+        if (sz && [...sizeEl.options].some(o => parseInt(o.value) === sz)) {
+            sizeEl.value = String(sz);
+        }
+
+        // config.prop 里的值优先（重启后以它为准）
+        const { stdout: cfgRaw } = await exec(`cat ${moduleDir}/config.prop 2>/dev/null || echo ""`);
+        const m1 = cfgRaw.match(/^RECOMP_ALGO1=(\S+)/m);
+        const m2 = cfgRaw.match(/^RECOMP_ALGO2=(\S+)/m);
+        if (m1 && document.querySelector(`#cfg-recomp1 option[value="${m1[1]}"]`))
+            document.getElementById('cfg-recomp1').value = m1[1];
+        if (m2 && document.querySelector(`#cfg-recomp2 option[value="${m2[1]}"]`))
+            document.getElementById('cfg-recomp2').value = m2[1];
+
+    } catch (e) {
+        console.error('loadZramOptions error:', e);
+    }
+}
+
+/* 应用重压缩算法：直接写 sysfs，不需要 swapoff */
+async function applyRecompAlgo() {
+    const a1 = document.getElementById('cfg-recomp1').value;
+    const a2 = document.getElementById('cfg-recomp2').value;
+    try {
+        const { stdout: r1 } = await exec(
+            `echo "algo=${a1} priority=1" > /sys/block/zram0/recomp_algorithm 2>&1; echo rc=$?`
+        );
+        const { stdout: r2 } = await exec(
+            `echo "algo=${a2} priority=2" > /sys/block/zram0/recomp_algorithm 2>&1; echo rc=$?`
+        );
+        const ok1 = /rc=0/.test(r1), ok2 = /rc=0/.test(r2);
+
+        // 写回 config.prop，保证重启后保持
+        await exec(`sed -i 's/^RECOMP_ALGO1=.*/RECOMP_ALGO1=${a1}/' ${moduleDir}/config.prop 2>/dev/null; ` +
+                   `grep -q '^RECOMP_ALGO1=' ${moduleDir}/config.prop || echo 'RECOMP_ALGO1=${a1}' >> ${moduleDir}/config.prop`);
+        await exec(`sed -i 's/^RECOMP_ALGO2=.*/RECOMP_ALGO2=${a2}/' ${moduleDir}/config.prop 2>/dev/null; ` +
+                   `grep -q '^RECOMP_ALGO2=' ${moduleDir}/config.prop || echo 'RECOMP_ALGO2=${a2}' >> ${moduleDir}/config.prop`);
+
+        if (ok1 && ok2) toast(`已应用：一级 ${a1} / 二级 ${a2}`);
+        else toast(`部分失败 1:${ok1 ? 'ok' : '失败'} 2:${ok2 ? 'ok' : '失败'}`, -1);
+        await refreshStatus();
+    } catch (e) {
+        toast('应用失败', -1);
+    }
+}
+
+/*
+ * 应用主算法与大小：必须 swapoff → reset → 重设 → swapon。
+ *
+ * 风险点在 swapoff：已换出的页要全部读回内存。
+ * 若可用内存不足，会触发 OOM 杀进程甚至卡死。
+ * 故先用 mm_stat 第 1 字段（orig_data_size，解压后字节数）估算所需内存，
+ * 与 MemAvailable 比较，不足则拒绝执行。
+ */
+async function applyZramDevice() {
+    const algo = document.getElementById('cfg-algo').value;
+    const size = document.getElementById('cfg-size').value;
+    /* 重建会清空 recomp_algorithm，需一并重设回当前选择 */
+    const a1 = document.getElementById('cfg-recomp1').value;
+    const a2 = document.getElementById('cfg-recomp2').value;
+
+    try {
+        // ---- 安全检查 ----
+        const { stdout: memRaw } = await exec(`awk '/MemAvailable/{print $2}' /proc/meminfo`);
+        const { stdout: mmRaw } = await exec(`awk '{print $1}' /sys/block/zram0/mm_stat`);
+        const availKB = parseInt(memRaw.trim()) || 0;
+        const origBytes = parseInt(mmRaw.trim()) || 0;
+        const needKB = Math.floor(origBytes / 1024);
+        const sizeGB = (parseInt(size) / 1073741824).toFixed(0);
+
+        /*
+         * 余量系数 1.15：解压过程本身需要少量额外内存。
+         * 不足时不直接拒绝 —— 内核 LMK 会先杀后台腾空间，
+         * 多数情况下仍能完成，只是体验差。
+         * 改为强警告 + 二次确认，把决定权交给用户。
+         */
+        const enough = availKB >= needKB * 1.15;
+        const needMiB = (needKB / 1024).toFixed(0);
+        const availMiB = (availKB / 1024).toFixed(0);
+
+        let confirmMsg;
+        if (enough) {
+            confirmMsg =
+                `即将重建 zram：\n算法 ${algo}，大小 ${sizeGB} GB\n\n` +
+                `需读回 ${needMiB} MiB，当前可用 ${availMiB} MiB，内存充足。\n` +
+                `过程会有短暂卡顿，确定继续？`;
+        } else {
+            confirmMsg =
+                `⚠️ 可用内存可能不足！\n\n` +
+                `需读回 ${needMiB} MiB，当前可用仅 ${availMiB} MiB。\n` +
+                `swapoff 期间系统会杀后台腾空间，可能明显卡顿甚至短暂无响应。\n\n` +
+                `强烈建议先清理后台。仍要继续？`;
+        }
+        if (!confirm(confirmMsg)) { toast('已取消'); return; }
+
+        toast('正在重建 zram，请勿操作...');
+
+        // ---- 重建 ----
+        const script =
+            `swapoff /dev/block/zram0 2>/dev/null; ` +
+            `echo 1 > /sys/block/zram0/reset; sleep 1; ` +
+            `echo 0 > /sys/block/zram0/disksize; ` +
+            `echo 8 > /sys/block/zram0/max_comp_streams; ` +
+            `echo '${algo}' > /sys/block/zram0/comp_algorithm; ` +
+            `echo '${size}' > /sys/block/zram0/disksize; ` +
+            `mkswap /dev/block/zram0 >/dev/null 2>&1; ` +
+            `swapon /dev/block/zram0 >/dev/null 2>&1; ` +
+            `echo "algo=${a1} priority=1" > /sys/block/zram0/recomp_algorithm; ` +
+            `echo "algo=${a2} priority=2" > /sys/block/zram0/recomp_algorithm; ` +
+            `echo done`;
+        await exec(script);
+
+        // 写回 config.prop
+        await exec(`sed -i 's/^ZRAM_ALGO=.*/ZRAM_ALGO=${algo}/' ${moduleDir}/config.prop 2>/dev/null`);
+        await exec(`sed -i 's/^ZRAM_SIZE=.*/ZRAM_SIZE=${size}/' ${moduleDir}/config.prop 2>/dev/null`);
+
+        toast(`已重建：${algo} / ${sizeGB} GB`);
+        await refreshStatus();
+    } catch (e) {
+        toast('重建失败', -1);
     }
 }
 
