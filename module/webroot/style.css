@@ -477,3 +477,56 @@ select.input {
     border-radius: 4px;
     flex-shrink: 0;
 }
+
+
+/* ===== 自定义确认弹窗 ===== */
+.modal-mask {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, .62);
+    z-index: 9999;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+}
+.modal-mask.show { display: flex; }
+
+.modal-box {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 20px;
+    max-width: 380px;
+    width: 100%;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, .55);
+}
+.modal-title {
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 12px;
+}
+.modal-body {
+    font-size: 13px;
+    line-height: 1.75;
+    color: var(--text-secondary);
+    white-space: pre-line;
+    margin-bottom: 20px;
+    max-height: 40vh;
+    overflow-y: auto;
+}
+.modal-btns { display: flex; gap: 10px; }
+.modal-btns .btn { flex: 1; }
+
+.btn-ghost {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-primary);
+}
+.btn-ghost:hover { background: rgba(255, 255, 255, .06); }
+
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+
+/* 日志文件不存在时 tab 置灰 */
+.log-tab.disabled { opacity: .38; text-decoration: line-through; }
