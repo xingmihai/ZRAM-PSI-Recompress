@@ -8,6 +8,11 @@ ZRAM_ALGO=lz4kd
 # 8589934592(8G) 12884901888(12G) 17179869184(16G) 25769803776(24G)
 ZRAM_SIZE=8589934592
 
+# 重压缩算法（WebUI 可改，改后即时生效并写回本文件）
+# 一级：优先尝试；二级：处理一级残留的页
+RECOMP_ALGO1=zstdn
+RECOMP_ALGO2=zstdn_o
+
 # ========== psi_recomp 守护进程参数（可选，缺省用编译默认值） ==========
 # 以下参数仅在存在 psi.conf 时生效；如需调参请创建 module/psi.conf 文件
 # 格式：KEY=VALUE，每行一个，# 开头为注释
