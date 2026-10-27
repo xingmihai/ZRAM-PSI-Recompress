@@ -230,6 +230,7 @@
                 <button class="log-tab active" data-log="psi" onclick="switchLog('psi')">psi.log</button>
                 <button class="log-tab" data-log="module" onclick="switchLog('module')">zram_module.log</button>
                 <button class="log-tab" data-log="recompress" onclick="switchLog('recompress')">recompress.log</button>
+                <button class="log-tab" data-log="apply" onclick="switchLog('apply')">zram_apply.log</button>
             </div>
             <pre class="log-viewer" id="log-viewer">点击「刷新」加载日志...</pre>
         </div>
@@ -275,5 +276,17 @@
     </div>
 
     <script type="module" src="app.js"></script>
+<!-- 自定义确认弹窗：KernelSU WebView 不实现原生 confirm()，必须自绘 -->
+<div class="modal-mask" id="modal-mask">
+    <div class="modal-box">
+        <div class="modal-title" id="modal-title">确认</div>
+        <div class="modal-body" id="modal-body"></div>
+        <div class="modal-btns">
+            <button class="btn btn-ghost" id="modal-cancel">取消</button>
+            <button class="btn btn-danger" id="modal-ok">确定</button>
+        </div>
+    </div>
+</div>
+
 </body>
 </html>
