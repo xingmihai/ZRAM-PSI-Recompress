@@ -10,6 +10,15 @@ let moduleDir = '';
 let currentLogType = 'psi';
 let autoRefreshTimer = null;
 
+/*
+ * WebUI 构建标记：每次改动 WebUI 就 +1。
+ * KernelSU 的 WebView 会缓存 index.html / app.js，
+ * 刷了新模块后页面可能仍是旧的，而 module.prop 版本号
+ * 由 app.js 实时读取、永远显示最新 —— 无法据此判断页面是否新鲜。
+ * 页面上显示此标记，与仓库当前值比对即可确认。
+ */
+const WEBUI_BUILD = 8;
+
 // ========== 初始化 ==========
 document.addEventListener('DOMContentLoaded', async () => {
     await init();
@@ -24,6 +33,8 @@ async function init() {
             moduleDir = parsed.moduleDir || '/data/adb/modules/ZRAM-PSI-Recompress';
             document.getElementById('info-version').textContent = parsed.version || '-';
             document.getElementById('info-path').textContent = moduleDir;
+            const b = document.getElementById('info-build');
+            if (b) b.textContent = String(WEBUI_BUILD);
         }
     } catch (e) {
         moduleDir = '/data/adb/modules/ZRAM-PSI-Recompress';
@@ -909,3 +920,16 @@ window.clearLog = clearLog;
 window.triggerRecompress = triggerRecompress;
 window.restartDaemon = restartDaemon;
 window.testPSI = testPSI;
+
+/*
+ * 以下三个也必须暴露，否则 HTML 里的 onclick/oninput 会报
+ * "ReferenceError: xxx is not defined"，表现为点了按钮毫无反应。
+ *
+ * 成因：index.html 用 <script type="module"> 加载 app.js，
+ * ES module 顶层声明只存在于模块作用域，不会挂到 window，
+ * 而内联 onclick 是在全局作用域里求值的。
+ * v1.3.0 新增这几个函数时漏加了暴露，导致按钮静默失效。
+ */
+window.applyRecompAlgo = applyRecompAlgo;
+window.applyZramDevice = applyZramDevice;
+window.updateSliderVal = updateSliderVal;
