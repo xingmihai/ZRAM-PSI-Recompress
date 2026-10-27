@@ -143,6 +143,41 @@ async function refreshStatus() {
     }
 }
 
+// ========== 弹窗 ==========
+
+/*
+ * KernelSU 的 WebView 未实现原生 confirm()
+ * （kernelsu.js 里没有任何对话框相关代码，WebView 没配 onJsConfirm），
+ * 原生 confirm() 会立即返回 false，导致点了按钮"没反应"。
+ * 故自绘弹窗替代。
+ */
+function showConfirm(title, body, okText = '确定') {
+    return new Promise(resolve => {
+        const mask = document.getElementById('modal-mask');
+        const okBtn = document.getElementById('modal-ok');
+        const cancelBtn = document.getElementById('modal-cancel');
+        if (!mask || !okBtn || !cancelBtn) {
+            /* 弹窗 DOM 缺失时不能静默失败，退回原生以免功能彻底不可用 */
+            resolve(window.confirm(body));
+            return;
+        }
+        document.getElementById('modal-title').textContent = title;
+        document.getElementById('modal-body').textContent = body;
+        okBtn.textContent = okText;
+        mask.classList.add('show');
+
+        const done = v => {
+            mask.classList.remove('show');
+            okBtn.onclick = null;
+            cancelBtn.onclick = null;
+            resolve(v);
+        };
+        okBtn.onclick = () => done(true);
+        cancelBtn.onclick = () => done(false);
+        mask.onclick = e => { if (e.target === mask) done(false); };
+    });
+}
+
 // ========== ZRAM 配置 ==========
 
 /*
@@ -292,30 +327,54 @@ async function applyZramDevice() {
                 `swapoff 期间系统会杀后台腾空间，可能明显卡顿甚至短暂无响应。\n\n` +
                 `强烈建议先清理后台。仍要继续？`;
         }
-        if (!confirm(confirmMsg)) { toast('已取消'); return; }
+        const go = await showConfirm('重建 ZRAM', confirmMsg, '仍要继续');
+        if (!go) { toast('已取消'); return; }
 
         toast('正在重建 zram，请勿操作...');
 
-        // ---- 重建 ----
-        const script =
-            `swapoff /dev/block/zram0 2>/dev/null; ` +
-            `echo 1 > /sys/block/zram0/reset; sleep 1; ` +
-            `echo 0 > /sys/block/zram0/disksize; ` +
-            `echo 8 > /sys/block/zram0/max_comp_streams; ` +
-            `echo '${algo}' > /sys/block/zram0/comp_algorithm; ` +
-            `echo '${size}' > /sys/block/zram0/disksize; ` +
-            `mkswap /dev/block/zram0 >/dev/null 2>&1; ` +
-            `swapon /dev/block/zram0 >/dev/null 2>&1; ` +
-            `echo "algo=${a1} priority=1" > /sys/block/zram0/recomp_algorithm; ` +
-            `echo "algo=${a2} priority=2" > /sys/block/zram0/recomp_algorithm; ` +
-            `echo done`;
-        await exec(script);
+        /*
+         * 分步执行并记录每步返回值到 zram_apply.log。
+         * 原先整条命令串成一行，任何一步失败都看不出来；
+         * 且 swapoff 大容量耗时可能较长，需要可追溯的执行记录。
+         */
+        const LOG = `${moduleDir}/zram_apply.log`;
+        await exec(`: > ${LOG}`);
+        await exec(`echo "$(date '+%F %H:%M:%S') apply algo=${algo} size=${size}" >> ${LOG}`);
+
+        const steps = [
+            ['swapoff',      `swapoff /dev/block/zram0 2>&1`],
+            ['reset',        `echo 1 > /sys/block/zram0/reset 2>&1`],
+            ['disksize0',    `echo 0 > /sys/block/zram0/disksize 2>&1`],
+            ['streams',      `echo 8 > /sys/block/zram0/max_comp_streams 2>&1`],
+            ['comp_algo',    `echo '${algo}' > /sys/block/zram0/comp_algorithm 2>&1`],
+            ['disksize',     `echo '${size}' > /sys/block/zram0/disksize 2>&1`],
+            ['mkswap',       `mkswap /dev/block/zram0 2>&1`],
+            ['swapon',       `swapon /dev/block/zram0 2>&1`],
+            ['recomp1',      `echo "algo=${a1} priority=1" > /sys/block/zram0/recomp_algorithm 2>&1`],
+            ['recomp2',      `echo "algo=${a2} priority=2" > /sys/block/zram0/recomp_algorithm 2>&1`],
+        ];
+
+        let failed = [];
+        for (const [name, cmd] of steps) {
+            const { errno, stdout, stderr } = await exec(`${cmd}; echo "rc=$?"`);
+            const rc = (stdout || '').match(/rc=(\d+)/);
+            const code = rc ? parseInt(rc[1]) : -1;
+            const out = ((stdout || '') + (stderr || '')).replace(/rc=\d+/, '').trim();
+            await exec(`echo "[${name}] rc=${code} ${out}" >> ${LOG}`);
+            if (code !== 0) failed.push(`${name}(rc=${code})`);
+            /* 每步之间留一点间隔，避免 sysfs 连续写入过快 */
+            if (name === 'reset') await exec(`sleep 1`);
+        }
 
         // 写回 config.prop
         await exec(`sed -i 's/^ZRAM_ALGO=.*/ZRAM_ALGO=${algo}/' ${moduleDir}/config.prop 2>/dev/null`);
         await exec(`sed -i 's/^ZRAM_SIZE=.*/ZRAM_SIZE=${size}/' ${moduleDir}/config.prop 2>/dev/null`);
 
-        toast(`已重建：${algo} / ${sizeGB} GB`);
+        if (failed.length) {
+            toast(`部分步骤失败：${failed.join(', ')}，详见 zram_apply.log`, -1);
+        } else {
+            toast(`已重建：${algo} / ${sizeGB} GB`);
+        }
         await refreshStatus();
     } catch (e) {
         toast('重建失败', -1);
@@ -638,6 +697,36 @@ SKIP_LOG_EVERY=5`;
 }
 
 // ========== 日志管理 ==========
+/*
+ * 检测各日志文件是否存在，不存在则把 tab 置灰并提示原因。
+ * recompress.log 只在 helper 启动失败、回退到 shell 循环时才创建，
+ * 正常走 PSI 时不会生成 —— 不提示会让人以为模块有问题。
+ */
+async function updateLogTabs() {
+    const files = {
+        psi: 'psi.log',
+        module: 'zram_module.log',
+        recompress: 'recompress.log',
+        apply: 'zram_apply.log',
+    };
+    const reasons = {
+        recompress: '未生成（正常）：仅当 PSI 守护启动失败、回退 shell 循环时才会创建',
+        apply: '未生成：尚未在 WebUI 执行过「应用主算法与大小」',
+    };
+    for (const [key, name] of Object.entries(files)) {
+        const btn = document.querySelector(`.log-tab[data-log="${key}"]`);
+        if (!btn) continue;
+        const { stdout } = await exec(`test -s ${moduleDir}/${name} && echo y || echo n`);
+        if (stdout.trim() === 'y') {
+            btn.classList.remove('disabled');
+            btn.title = '';
+        } else {
+            btn.classList.add('disabled');
+            btn.title = reasons[key] || '文件不存在或为空';
+        }
+    }
+}
+
 async function refreshLog() {
     const viewer = document.getElementById('log-viewer');
 
@@ -646,10 +735,12 @@ async function refreshLog() {
         case 'psi': logFile = 'psi.log'; break;
         case 'module': logFile = 'zram_module.log'; break;
         case 'recompress': logFile = 'recompress.log'; break;
+        case 'apply': logFile = 'zram_apply.log'; break;
         default: logFile = 'psi.log';
     }
 
     try {
+        await updateLogTabs();
         const { stdout } = await exec(`tail -100 ${moduleDir}/${logFile} 2>/dev/null || echo "(日志文件不存在或为空)"`);
         viewer.textContent = stdout || '(空)';
         viewer.scrollTop = viewer.scrollHeight;
@@ -676,6 +767,7 @@ async function clearLog() {
             case 'psi': logFile = 'psi.log'; break;
             case 'module': logFile = 'zram_module.log'; break;
             case 'recompress': logFile = 'recompress.log'; break;
+        case 'apply': logFile = 'zram_apply.log'; break;
         }
 
         await exec(`: > ${moduleDir}/${logFile}`);
