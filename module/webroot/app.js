@@ -17,7 +17,7 @@ let autoRefreshTimer = null;
  * 由 app.js 实时读取、永远显示最新 —— 无法据此判断页面是否新鲜。
  * 页面上显示此标记，与仓库当前值比对即可确认。
  */
-const WEBUI_BUILD = 9;
+const WEBUI_BUILD = 10;
 
 // ========== 初始化 ==========
 document.addEventListener('DOMContentLoaded', async () => {
@@ -800,6 +800,10 @@ async function updateLogTabs() {
     for (const [key, name] of Object.entries(files)) {
         const btn = document.querySelector(`.log-tab[data-log="${key}"]`);
         if (!btn) continue;
+        /* tab 行可横向滚动，把当前选中项滚进可视区 */
+        if (key === currentLogType && btn.scrollIntoView) {
+            btn.scrollIntoView({ inline: 'center', block: 'nearest' });
+        }
         const { stdout } = await exec(`test -s ${moduleDir}/${name} && echo y || echo n`);
         if (stdout.trim() === 'y') {
             btn.classList.remove('disabled');
