@@ -19,8 +19,8 @@ jobs:
       - name: Sync version from source to module.prop
         run: |
           set -e
-          # 从 psi_recomp.c 头部注释提取版本号
-          VERSION=$(grep -oP 'v\d+\.\d+\.\d+' src/psi_recomp.c | head -1)
+          # 从 psi_recomp.c 头部注释的「vX.Y.Z 变更」行提取最新版本号（须写在最上面）
+          VERSION=$(grep -oP 'v\d+\.\d+\.\d+(?= 变更)' src/psi_recomp.c | head -1)
           if [ -n "$VERSION" ]; then
             echo "Detected version: $VERSION"
             sed -i "s/version=.*/version=$VERSION/" module/module.prop
@@ -52,6 +52,8 @@ jobs:
           # 改为动态 PIE 链接（仅依赖 Bionic libc，late_start 阶段 /system 已挂载）
           # 同时按 16KB 对齐以兼容 16KB page size 内核（4KB 设备上同样安全）
           $CC -O2 -fPIE -pie -Wall -Wextra -Wshadow \
+              -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
+              -Wl,-z,relro,-z,now \
               -Wl,-z,max-page-size=65536 \
               -Wl,-z,common-page-size=65536 \
               -o build/psi_recomp src/psi_recomp.c

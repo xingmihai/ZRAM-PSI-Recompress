@@ -7,10 +7,29 @@ if [ ! -f "$CONFIG_FILE" ]; then
   exit 1
 fi
 
-. "$CONFIG_FILE"
+# 安全读取配置：不再 `. config.prop`（source 等于以 root 执行文件内容，
+# 一旦 WebUI 或其他途径写入恶意值就会在每次开机时被执行）。
+# 改为逐项取值并按白名单校验，非法值一律视为未设置。
+get_cfg() {
+  sed -n "s/^$1=//p" "$CONFIG_FILE" | head -n 1 | tr -d '\r' | sed 's/[[:space:]]*$//'
+}
+valid_name() { case "$1" in ''|*[!A-Za-z0-9_.-]*) return 1;; esac; return 0; }
+valid_num()  { case "$1" in ''|*[!0-9]*) return 1;; esac; return 0; }
 
-if [ -z "$ZRAM_ALGO" ] || [ -z "$ZRAM_SIZE" ]; then
-  echo "ZRAM_ALGO or ZRAM_SIZE is not set! Exiting."
+ZRAM_ALGO=$(get_cfg ZRAM_ALGO)
+ZRAM_SIZE=$(get_cfg ZRAM_SIZE)
+RECOMP_ALGO1=$(get_cfg RECOMP_ALGO1)
+RECOMP_ALGO2=$(get_cfg RECOMP_ALGO2)
+PSI_THRESH_NORMAL=$(get_cfg PSI_THRESH_NORMAL)
+PSI_IDLE_SEC=$(get_cfg PSI_IDLE_SEC)
+
+valid_name "$RECOMP_ALGO1" || RECOMP_ALGO1=""
+valid_name "$RECOMP_ALGO2" || RECOMP_ALGO2=""
+valid_num "$PSI_THRESH_NORMAL" || PSI_THRESH_NORMAL=""
+valid_num "$PSI_IDLE_SEC" || PSI_IDLE_SEC=""
+
+if ! valid_name "$ZRAM_ALGO" || ! valid_num "$ZRAM_SIZE"; then
+  echo "ZRAM_ALGO or ZRAM_SIZE is missing/invalid! Exiting."
   exit 1
 fi
 
@@ -129,7 +148,8 @@ ST="$MODDIR/status"
 THRESH=${PSI_THRESH_NORMAL:-40000}
 IDLE=${PSI_IDLE_SEC:-1800}
 while true; do
-  huge=$(awk '{print $8}' /sys/block/zram0/mm_stat)
+  huge=$(awk '{print $8}' /sys/block/zram0/mm_stat 2>/dev/null)
+  case "$huge" in ''|*[!0-9]*) huge=0;; esac
   ts=$(date '+%F %H:%M:%S')
   if [ "$huge" -gt "$THRESH" ]; then
     echo "=== $ts ===" >> "$RLOG"
