@@ -17,7 +17,27 @@ let autoRefreshTimer = null;
  * 由 app.js 实时读取、永远显示最新 —— 无法据此判断页面是否新鲜。
  * 页面上显示此标记，与仓库当前值比对即可确认。
  */
-const WEBUI_BUILD = 10;
+const WEBUI_BUILD = 11;
+
+/*
+ * 输入校验（v1.3.5）：
+ * 本页通过 ksu.exec 以 root 执行 shell，凡是拼进命令的值都必须先过白名单。
+ * 算法名来自 sysfs、config.prop、<select>；size 来自 <select>；
+ * moduleDir 来自 KernelSU 的 moduleInfo —— 都不应被直接信任。
+ */
+const DEFAULT_MODDIR = '/data/adb/modules/ZRAM-PSI-Recompress';
+const isSafeAlgo = (s) => typeof s === 'string' && /^[A-Za-z0-9_.-]{1,32}$/.test(s);
+const isDigits   = (s) => typeof s === 'string' && /^\d{1,15}$/.test(s);
+const isSafePath = (s) => typeof s === 'string' && /^\/[A-Za-z0-9_\/.-]{1,200}$/.test(s) && !s.includes('..');
+/* 写日志前的转义：只留可打印 ASCII，并包进单引号（单引号内 $() 与反引号不展开） */
+const shQuote = (t) => "'" + String(t).replace(/[^\x20-\x7E\n]/g, '?').replace(/'/g, "'\\''") + "'";
+/* PSI trigger：<some|full> <stall_us> <window_us>，与守护进程的校验一致 */
+function isValidPsiTrigger(s) {
+    const m = /^(some|full) (\d{1,9}) (\d{1,9})$/.exec(s || '');
+    if (!m) return false;
+    const stall = Number(m[2]), win = Number(m[3]);
+    return win >= 500000 && win <= 10000000 && stall > 0 && stall <= win;
+}
 
 // ========== 初始化 ==========
 document.addEventListener('DOMContentLoaded', async () => {
@@ -30,14 +50,14 @@ async function init() {
         const info = moduleInfo();
         if (info) {
             const parsed = JSON.parse(info);
-            moduleDir = parsed.moduleDir || '/data/adb/modules/ZRAM-PSI-Recompress';
+            moduleDir = isSafePath(parsed.moduleDir) ? parsed.moduleDir : DEFAULT_MODDIR;
             document.getElementById('info-version').textContent = parsed.version || '-';
             document.getElementById('info-path').textContent = moduleDir;
             const b = document.getElementById('info-build');
             if (b) b.textContent = String(WEBUI_BUILD);
         }
     } catch (e) {
-        moduleDir = '/data/adb/modules/ZRAM-PSI-Recompress';
+        moduleDir = DEFAULT_MODDIR;
     }
 
     // 初始化滑块（绑定事件 + 数值气泡）
@@ -237,7 +257,9 @@ function parseAlgoList(raw) {
     const cleaned = raw.replace(/\[|\]/g, ' ');
     return cleaned.split(/\s+/).map(x => x.trim())
                   /* 剔除 recomp_algorithm 每行的 "#1:" / "#2:" 序号标记 */
-                  .filter(x => x && x !== '#' && !/^#?\d+:$/.test(x));
+                  .filter(x => x && x !== '#' && !/^#?\d+:$/.test(x))
+                  /* 只保留合法算法名：内核吐出的任何异常内容都不进入 DOM / shell */
+                  .filter(isSafeAlgo);
 }
 
 async function loadZramOptions() {
@@ -257,7 +279,8 @@ async function loadZramOptions() {
         const fill = (id, list) => {
             const el = document.getElementById(id);
             if (!el || !list.length) return;
-            el.innerHTML = list.map(a => `<option value="${a}">${a}</option>`).join('');
+            /* 用 DOM API 建 option，不经 innerHTML，杜绝 sysfs 内容注入 HTML */
+            el.replaceChildren(...list.map(a => new Option(a, a)));
         };
         fill('cfg-algo', compList);
         fill('cfg-recomp1', rList);
@@ -287,10 +310,10 @@ async function loadZramOptions() {
         const { stdout: cfgRaw } = await exec(`cat ${moduleDir}/config.prop 2>/dev/null || echo ""`);
         const m1 = cfgRaw.match(/^RECOMP_ALGO1=(\S+)/m);
         const m2 = cfgRaw.match(/^RECOMP_ALGO2=(\S+)/m);
-        if (m1 && document.querySelector(`#cfg-recomp1 option[value="${m1[1]}"]`))
-            document.getElementById('cfg-recomp1').value = m1[1];
-        if (m2 && document.querySelector(`#cfg-recomp2 option[value="${m2[1]}"]`))
-            document.getElementById('cfg-recomp2').value = m2[1];
+        const hasOpt = (id, v) => isSafeAlgo(v) &&
+            [...document.getElementById(id).options].some(o => o.value === v);
+        if (m1 && hasOpt('cfg-recomp1', m1[1])) document.getElementById('cfg-recomp1').value = m1[1];
+        if (m2 && hasOpt('cfg-recomp2', m2[1])) document.getElementById('cfg-recomp2').value = m2[1];
 
     } catch (e) {
         console.error('loadZramOptions error:', e);
@@ -301,6 +324,7 @@ async function loadZramOptions() {
 async function applyRecompAlgo() {
     const a1 = document.getElementById('cfg-recomp1').value;
     const a2 = document.getElementById('cfg-recomp2').value;
+    if (!isSafeAlgo(a1) || !isSafeAlgo(a2)) { toast('算法名非法，已取消', -1); return; }
     try {
         const { stdout: r1 } = await exec(
             `echo "algo=${a1} priority=1" > /sys/block/zram0/recomp_algorithm 2>&1; echo rc=$?`
@@ -356,6 +380,10 @@ async function applyZramDevice() {
     /* 重建会清空 recomp_algorithm，需一并重设回当前选择 */
     const a1 = document.getElementById('cfg-recomp1').value;
     const a2 = document.getElementById('cfg-recomp2').value;
+    if (!isSafeAlgo(algo) || !isSafeAlgo(a1) || !isSafeAlgo(a2) || !isDigits(size)) {
+        toast('参数非法（算法名或大小），已取消', -1);
+        return;
+    }
 
     try {
         // ---- 安全检查 ----
@@ -431,7 +459,7 @@ async function applyZramDevice() {
             const rc = (stdout || '').match(/rc=(\d+)/);
             const code = rc ? parseInt(rc[1]) : -1;
             const out = ((stdout || '') + (stderr || '')).replace(/rc=\d+/, '').trim();
-            await exec(`echo "[${name}] rc=${code}${canFail ? ' (可容忍)' : ''} ${out}" >> ${LOG}`);
+            await exec(`echo ${shQuote(`[${name}] rc=${code}${canFail ? ' (可容忍)' : ''} ${out}`)} >> ${LOG}`);
             if (code !== 0) {
                 if (canFail) tolerant.push(`${name}(rc=${code})`);
                 else failed.push(`${name}(rc=${code})`);
@@ -443,7 +471,7 @@ async function applyZramDevice() {
         /* 复核重压缩算法是否真正生效 */
         const { stdout: rcNow } = await exec(`cat /sys/block/zram0/recomp_algorithm 2>&1`);
         await exec(`echo "--- recomp_algorithm ---" >> ${LOG}`);
-        await exec(`echo "${rcNow.trim().replace(/"/g, "'")}" >> ${LOG}`);
+        await exec(`echo ${shQuote(rcNow.trim())} >> ${LOG}`);
         const recompOk = /\bzstdn\b|\bzstdn_o\b|\blz4\b|\blzo\b|\bzstd\b/.test(rcNow);
 
         // 写回 config.prop
@@ -484,6 +512,7 @@ async function refreshStats() {
     try {
         let checks = 0, psiEvents = 0, compress = 0, saved = 0, peak = 0, huge = -1;
         let lastComp = 0;
+        let savedMemMiB = null;   /* null = 守护进程未提供真实内存降幅 */
         /* 必须在 if 块外声明：下方 thrEl 处会用到，
            块内 const 会导致 ReferenceError 被 catch 静默吞掉，
            连带后面「距上次压缩」也不再执行，两格恒显示 - */
@@ -506,6 +535,8 @@ async function refreshStats() {
             compress = parseInt(st.recompress) || 0;
             peak = parseInt(st.peak) || 0;
             saved = parseInt(st.total_saved) || 0;
+            /* v1.3.5+ 守护进程直接给出 mem_used_total 降幅（MiB） */
+            if (st.saved_mem_mib !== undefined) savedMemMiB = parseFloat(st.saved_mem_mib) || 0;
             huge = parseInt(st.huge);
             lastComp = parseInt(st.last_comp) || 0;
         } else {
@@ -532,8 +563,8 @@ async function refreshStats() {
             checks = Math.max(checks, parseInt(lineCount.trim()) || 0);
         }
 
-        /* 4096 字节/页 -> MiB：pages / 256 */
-        const savedMiB = (saved / 256).toFixed(1);
+        /* 新版：真实内存降幅；旧版守护进程无此字段，退回「页数×4KB」的估算值 */
+        const savedMiB = (savedMemMiB !== null ? savedMemMiB : saved / 256).toFixed(1);
 
         document.getElementById('stat-checks').textContent = checks.toLocaleString();
         document.getElementById('stat-compress').textContent = compress.toLocaleString();
@@ -703,17 +734,27 @@ async function saveConfig() {
 }
 
 function buildConfigFromForm() {
+    /* 数值项必须是纯数字；PSI_TRIGGER 必须符合格式。校验失败直接抛错，不写文件 */
+    const num = (id, def) => {
+        const v = String(getInputValue(id, def)).trim();
+        if (!isDigits(v)) throw new Error(`参数非法：${id}`);
+        return v;
+    };
+    const psi = String(getInputValue('cfg-psi-trigger', 'some 15000 1000000')).trim();
+    if (!isValidPsiTrigger(psi)) {
+        throw new Error('PSI 触发条件格式应为「some|full stall_us window_us」，窗口 0.5~10 秒');
+    }
     return {
-        THRESH_NORMAL: getInputValue('cfg-thresh', '40000'),
-        HYSTERESIS_SEC: getInputValue('cfg-hyst-sec', '5400'),
-        HYST_MARGIN: getInputValue('cfg-hyst-margin', '8000'),
-        MIN_GAP_SEC: getInputValue('cfg-min-gap', '60'),
+        THRESH_NORMAL: num('cfg-thresh', '40000'),
+        HYSTERESIS_SEC: num('cfg-hyst-sec', '5400'),
+        HYST_MARGIN: num('cfg-hyst-margin', '8000'),
+        MIN_GAP_SEC: num('cfg-min-gap', '60'),
         /* 滑块单位是秒，配置里是毫秒 */
-        IDLE_TIMEOUT_MS: String(Number(getInputValue('cfg-idle-timeout', '1800')) * 1000),
-        PSI_TRIGGER: getInputValue('cfg-psi-trigger', 'some 15000 1000000'),
-        LOG_MAX_LINES: getInputValue('cfg-log-max', '600'),
-        LOG_KEEP_LINES: getInputValue('cfg-log-keep', '300'),
-        SKIP_LOG_EVERY: getInputValue('cfg-skip-every', '5'),
+        IDLE_TIMEOUT_MS: String(Number(num('cfg-idle-timeout', '1800')) * 1000),
+        PSI_TRIGGER: psi,
+        LOG_MAX_LINES: num('cfg-log-max', '600'),
+        LOG_KEEP_LINES: num('cfg-log-keep', '300'),
+        SKIP_LOG_EVERY: num('cfg-skip-every', '5'),
     };
 }
 
@@ -896,27 +937,32 @@ async function restartDaemon() {
     try {
         showActionResult('正在重启守护进程...', 'info');
 
-        // 停止现有进程
-        await exec(`kill $(cat ${moduleDir}/psi_recomp.pid 2>/dev/null) 2>/dev/null; sleep 1`);
+        /*
+         * 停止旧进程并等它真正退出：旧进程可能正阻塞在重压缩的 sysfs write 里，
+         * 最长等 15 秒。守护进程自身用 flock 做单实例保护，并且会自己写 PID 文件，
+         * 所以这里不再手动重写 PID（旧版调用 `psi_recomp --pid` 会把 `--pid`
+         * 当成日志路径多起一个进程，已删除）。
+         */
+        await exec(
+            `P=$(cat ${moduleDir}/psi_recomp.pid 2>/dev/null); ` +
+            `case "$P" in ''|*[!0-9]*) ;; *) kill "$P" 2>/dev/null; ` +
+            `i=0; while kill -0 "$P" 2>/dev/null && [ $i -lt 15 ]; do sleep 1; i=$((i+1)); done;; esac`
+        );
 
-        // 重新启动
         await exec(
             `chmod 0755 ${moduleDir}/psi_recomp 2>/dev/null; ` +
-            `setsid ${moduleDir}/psi_recomp ${moduleDir}/psi.log ${moduleDir}/psi.conf &`
+            `setsid ${moduleDir}/psi_recomp ${moduleDir}/psi.log ${moduleDir}/psi.conf >/dev/null 2>&1 &`
         );
 
-        /* `cmd &` 的退出码恒为 0，无法判断是否真的起来了，
-           必须等一小会儿后用 ps 实际检测进程。
-           同时重写 PID 文件：旧进程退出时可能删掉新进程写的 PID。 */
-        await new Promise(r => setTimeout(r, 1500));
-        const { stdout: psOut } = await exec(
-            `ps -A 2>/dev/null | grep -c "[p]si_recomp" || echo 0`
-        );
-        const alive = parseInt(psOut.trim()) > 0;
-        if (alive) {
-            await exec(`${moduleDir}/psi_recomp --pid 2>/dev/null; true`);
-            const { stdout: p } = await exec(`ps -A 2>/dev/null | grep "[p]si_recomp" | awk '{print $2}' | head -1`);
-            if (p.trim()) await exec(`echo ${p.trim()} > ${moduleDir}/psi_recomp.pid`);
+        /* `cmd &` 的退出码恒为 0；等 PID 文件出现并确认进程存活 */
+        let alive = false;
+        for (let i = 0; i < 6 && !alive; i++) {
+            await new Promise(r => setTimeout(r, 1000));
+            const { stdout } = await exec(
+                `P=$(cat ${moduleDir}/psi_recomp.pid 2>/dev/null); ` +
+                `case "$P" in ''|*[!0-9]*) echo n;; *) kill -0 "$P" 2>/dev/null && echo y || echo n;; esac`
+            );
+            alive = stdout.trim() === 'y';
         }
 
         if (alive) {
@@ -928,7 +974,7 @@ async function restartDaemon() {
                 await refreshStats();
             }, 2000);
         } else {
-            showActionResult('重启失败', 'error');
+            showActionResult('重启失败，请查看 psi.log', 'error');
         }
     } catch (e) {
         showActionResult('重启失败: ' + e.message, 'error');
