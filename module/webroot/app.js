@@ -17,7 +17,7 @@ let autoRefreshTimer = null;
  * 由 app.js 实时读取、永远显示最新 —— 无法据此判断页面是否新鲜。
  * 页面上显示此标记，与仓库当前值比对即可确认。
  */
-const WEBUI_BUILD = 11;
+const WEBUI_BUILD = 12;
 
 /*
  * 输入校验（v1.3.5）：
@@ -26,6 +26,12 @@ const WEBUI_BUILD = 11;
  * moduleDir 来自 KernelSU 的 moduleInfo —— 都不应被直接信任。
  */
 const DEFAULT_MODDIR = '/data/adb/modules/ZRAM-PSI-Recompress';
+/*
+ * zram 设备名：唯一来源是 config.prop 的 ZRAM_DEV，init() 里读取并校验，
+ * 所有 sysfs / dev 路径都由它构造；非法或缺失回退 zram0。
+ */
+let ZDEV = 'zram0';
+const isSafeZdev = (s) => typeof s === 'string' && /^zram\d{1,3}$/.test(s);
 const isSafeAlgo = (s) => typeof s === 'string' && /^[A-Za-z0-9_.-]{1,32}$/.test(s);
 const isDigits   = (s) => typeof s === 'string' && /^\d{1,15}$/.test(s);
 const isSafePath = (s) => typeof s === 'string' && /^\/[A-Za-z0-9_\/.-]{1,200}$/.test(s) && !s.includes('..');
@@ -37,6 +43,19 @@ function isValidPsiTrigger(s) {
     if (!m) return false;
     const stall = Number(m[2]), win = Number(m[3]);
     return win >= 500000 && win <= 10000000 && stall > 0 && stall <= win;
+}
+
+// ========== zram 设备名 ==========
+async function loadZramDev() {
+    try {
+        const { stdout } = await exec(
+            `sed -n 's/^ZRAM_DEV=//p' ${moduleDir}/config.prop 2>/dev/null | head -n 1`
+        );
+        const v = (stdout || '').trim();
+        ZDEV = isSafeZdev(v) ? v : 'zram0';
+    } catch (e) {
+        ZDEV = 'zram0';
+    }
 }
 
 // ========== 初始化 ==========
@@ -59,6 +78,9 @@ async function init() {
     } catch (e) {
         moduleDir = DEFAULT_MODDIR;
     }
+
+    // 读取 zram 设备名（config.prop 的 ZRAM_DEV），必须先于任何 sysfs 访问
+    await loadZramDev();
 
     // 初始化滑块（绑定事件 + 数值气泡）
     initSliders();
@@ -119,7 +141,7 @@ async function refreshStatus() {
 
         // 读取当前 huge 页数
         const { errno: hugeErrno, stdout: hugeOut } = await exec(
-            `awk '{print $8}' /sys/block/zram0/mm_stat 2>/dev/null || echo "-1"`
+            `awk '{print $8}' /sys/block/${ZDEV}/mm_stat 2>/dev/null || echo "-1"`
         );
         const huge = parseInt(hugeOut.trim());
         const hugeEl = document.getElementById('current-huge');
@@ -150,13 +172,13 @@ async function refreshStatus() {
 
         // ZRAM 算法
         const { stdout: algoOut } = await exec(
-            `cat /sys/block/zram0/comp_algorithm 2>/dev/null | grep -o '\\[.*\\]' | tr -d '[]' || echo "-"`
+            `cat /sys/block/${ZDEV}/comp_algorithm 2>/dev/null | grep -o '\\[.*\\]' | tr -d '[]' || echo "-"`
         );
         document.getElementById('zram-algo').textContent = algoOut.trim() || '-';
 
         // ZRAM 大小
         const { stdout: sizeOut } = await exec(
-            `cat /sys/block/zram0/disksize 2>/dev/null || echo "0"`
+            `cat /sys/block/${ZDEV}/disksize 2>/dev/null || echo "0"`
         );
         const sizeBytes = parseInt(sizeOut.trim());
         if (sizeBytes > 0) {
@@ -266,12 +288,12 @@ async function loadZramOptions() {
     try {
         // 主算法
         const { stdout: compRaw } = await exec(
-            `cat /sys/block/zram0/comp_algorithm 2>/dev/null || echo ""`
+            `cat /sys/block/${ZDEV}/comp_algorithm 2>/dev/null || echo ""`
         );
         const compList = parseAlgoList(compRaw.trim());
         // 重压缩算法（与 comp 列表在 Oplus 内核上基本一致，但以 recomp 接口为准更可靠）
         const { stdout: recompRaw } = await exec(
-            `cat /sys/block/zram0/recomp_algorithm 2>/dev/null || echo ""`
+            `cat /sys/block/${ZDEV}/recomp_algorithm 2>/dev/null || echo ""`
         );
         const recompList = parseAlgoList(recompRaw.trim());
         const rList = recompList.length ? [...new Set([...compList, ...recompList])] : compList;
@@ -298,7 +320,7 @@ async function loadZramOptions() {
 
         // 当前大小
         const { stdout: sizeRaw } = await exec(
-            `cat /sys/block/zram0/disksize 2>/dev/null || echo "0"`
+            `cat /sys/block/${ZDEV}/disksize 2>/dev/null || echo "0"`
         );
         const sz = parseInt(sizeRaw.trim()) || 0;
         const sizeEl = document.getElementById('cfg-size');
@@ -327,10 +349,10 @@ async function applyRecompAlgo() {
     if (!isSafeAlgo(a1) || !isSafeAlgo(a2)) { toast('算法名非法，已取消', -1); return; }
     try {
         const { stdout: r1 } = await exec(
-            `echo "algo=${a1} priority=1" > /sys/block/zram0/recomp_algorithm 2>&1; echo rc=$?`
+            `echo "algo=${a1} priority=1" > /sys/block/${ZDEV}/recomp_algorithm 2>&1; echo rc=$?`
         );
         const { stdout: r2 } = await exec(
-            `echo "algo=${a2} priority=2" > /sys/block/zram0/recomp_algorithm 2>&1; echo rc=$?`
+            `echo "algo=${a2} priority=2" > /sys/block/${ZDEV}/recomp_algorithm 2>&1; echo rc=$?`
         );
         const ok1 = /rc=0/.test(r1), ok2 = /rc=0/.test(r2);
 
@@ -388,7 +410,7 @@ async function applyZramDevice() {
     try {
         // ---- 安全检查 ----
         const { stdout: memRaw } = await exec(`awk '/MemAvailable/{print $2}' /proc/meminfo`);
-        const { stdout: mmRaw } = await exec(`awk '{print $1}' /sys/block/zram0/mm_stat`);
+        const { stdout: mmRaw } = await exec(`awk '{print $1}' /sys/block/${ZDEV}/mm_stat`);
         const availKB = parseInt(memRaw.trim()) || 0;
         const origBytes = parseInt(mmRaw.trim()) || 0;
         const needKB = Math.floor(origBytes / 1024);
@@ -439,17 +461,17 @@ async function applyZramDevice() {
          * 故 recomp 必须排在 disksize 之前。
          */
         const steps = [
-            ['swapoff',      `swapoff /dev/block/zram0 2>&1`],
-            ['reset',        `echo 1 > /sys/block/zram0/reset 2>&1`],
+            ['swapoff',      `swapoff /dev/block/${ZDEV} 2>&1`],
+            ['reset',        `echo 1 > /sys/block/${ZDEV}/reset 2>&1`],
             /* reset 后 disksize 已为 0，再写 0 可能返回 EINVAL，属可容忍 */
-            ['disksize0',    `echo 0 > /sys/block/zram0/disksize 2>&1`, true],
-            ['streams',      `echo 8 > /sys/block/zram0/max_comp_streams 2>&1`],
-            ['comp_algo',    `echo '${algo}' > /sys/block/zram0/comp_algorithm 2>&1`],
-            ['recomp1',      `echo "algo=${a1} priority=1" > /sys/block/zram0/recomp_algorithm 2>&1`],
-            ['recomp2',      `echo "algo=${a2} priority=2" > /sys/block/zram0/recomp_algorithm 2>&1`],
-            ['disksize',     `echo '${size}' > /sys/block/zram0/disksize 2>&1`],
-            ['mkswap',       `mkswap /dev/block/zram0 2>&1`],
-            ['swapon',       `swapon /dev/block/zram0 2>&1`],
+            ['disksize0',    `echo 0 > /sys/block/${ZDEV}/disksize 2>&1`, true],
+            ['streams',      `echo 8 > /sys/block/${ZDEV}/max_comp_streams 2>&1`],
+            ['comp_algo',    `echo '${algo}' > /sys/block/${ZDEV}/comp_algorithm 2>&1`],
+            ['recomp1',      `echo "algo=${a1} priority=1" > /sys/block/${ZDEV}/recomp_algorithm 2>&1`],
+            ['recomp2',      `echo "algo=${a2} priority=2" > /sys/block/${ZDEV}/recomp_algorithm 2>&1`],
+            ['disksize',     `echo '${size}' > /sys/block/${ZDEV}/disksize 2>&1`],
+            ['mkswap',       `mkswap /dev/block/${ZDEV} 2>&1`],
+            ['swapon',       `swapon /dev/block/${ZDEV} 2>&1`],
         ];
 
         let failed = [];
@@ -469,7 +491,7 @@ async function applyZramDevice() {
         }
 
         /* 复核重压缩算法是否真正生效 */
-        const { stdout: rcNow } = await exec(`cat /sys/block/zram0/recomp_algorithm 2>&1`);
+        const { stdout: rcNow } = await exec(`cat /sys/block/${ZDEV}/recomp_algorithm 2>&1`);
         await exec(`echo "--- recomp_algorithm ---" >> ${LOG}`);
         await exec(`echo ${shQuote(rcNow.trim())} >> ${LOG}`);
         const recompOk = /\bzstdn\b|\bzstdn_o\b|\blz4\b|\blzo\b|\bzstd\b/.test(rcNow);
@@ -494,6 +516,26 @@ async function applyZramDevice() {
 }
 
 // ========== 统计刷新 ==========
+
+/*
+ * 解析守护进程日志里的 stats:/exit: 汇总行，兼容新旧两种格式：
+ *   v1.3.5+ stats: total_comp=10, huge_reduced=145230 pages, mem_saved=212.6 MiB, peak=52341
+ *   v1.3.5+ exit:  checks=.. psi_events=.. throttled=.. recompress=.. peak=.. huge_reduced=.. pages mem_saved=.. MiB
+ *   旧版    stats: total_comp=10, total_saved=145230 pages (567.3 MiB), peak=52341
+ *   旧版    exit:  checks=.. psi_events=.. recompress=.. peak=.. total_saved=.. pages
+ * 旧格式括号里的 MiB 是 pages/256 的估算，故只认 mem_saved=（真实 mem_used_total 降幅）。
+ */
+function parseSummaryLine(line) {
+    const num = (re) => { const m = re.exec(line || ''); return m ? parseFloat(m[1]) : null; };
+    return {
+        compress:  num(/(?:total_comp|recompress)=(\d+)/),
+        peak:      num(/peak=(\d+)/),
+        checks:    num(/checks=(\d+)/),
+        psiEvents: num(/psi_events=(\d+)/),
+        memMiB:    num(/mem_saved=([\d.]+) MiB/),
+        pages:     num(/(?:huge_reduced|total_saved)=(\d+) pages/),
+    };
+}
 
 /* 解析 key=value 格式的 psi_stats 状态文件 */
 function parseStatsFile(content) {
@@ -541,22 +583,21 @@ async function refreshStats() {
             lastComp = parseInt(st.last_comp) || 0;
         } else {
             /* 回退：老版本守护进程没有状态文件，仍解析日志 */
+            /*
+             * 取日志里最近一条 stats:/exit: 汇总行。
+             * 不能用 tail -50：stats 每 10 次压缩才输出一行，很容易滚出窗口。
+             */
             const { stdout: logOut } = await exec(
-                `tail -50 ${moduleDir}/psi.log 2>/dev/null || echo ""`
+                `grep -E "(stats|exit): " ${moduleDir}/psi.log 2>/dev/null | tail -n 1`
             );
-            const statsMatch = logOut.match(/stats: total_comp=(\d+), total_saved=(\d+) pages.*?peak=(\d+)/);
-            const exitMatch = logOut.match(/exit: checks=(\d+) psi_events=(\d+) recompress=(\d+) peak=(\d+) total_saved=(\d+) pages/);
-            if (statsMatch) {
-                compress = parseInt(statsMatch[1]);
-                saved = parseInt(statsMatch[2]);
-                peak = parseInt(statsMatch[3]);
-            } else if (exitMatch) {
-                checks = parseInt(exitMatch[1]);
-                psiEvents = parseInt(exitMatch[2]);
-                compress = parseInt(exitMatch[3]);
-                peak = parseInt(exitMatch[4]);
-                saved = parseInt(exitMatch[5]);
-            }
+            const r = parseSummaryLine((logOut || '').trim());
+            if (r.compress !== null) compress = r.compress;
+            if (r.peak !== null) peak = r.peak;
+            if (r.checks !== null) checks = r.checks;
+            if (r.psiEvents !== null) psiEvents = r.psiEvents;
+            /* 新格式优先取真实内存降幅；旧格式退回页数（后面按 pages/256 估算） */
+            if (r.memMiB !== null) savedMemMiB = r.memMiB;
+            else if (r.pages !== null) saved = r.pages;
             const { stdout: lineCount } = await exec(
                 `wc -l < ${moduleDir}/psi.log 2>/dev/null || echo "0"`
             );
@@ -589,7 +630,7 @@ async function refreshStats() {
 
         /*
          * 「当前 huge」在「运行状态」卡片里已有实时读取的版本
-         * （直接读 /sys/block/zram0/mm_stat），此处不再重复显示
+         * （直接读 /sys/block/<zram>/mm_stat），此处不再重复显示
          * psi_stats 里的快照值，改为展示更有用的「距上次压缩」。
          */
         const lastCompEl = document.getElementById('stat-last-comp');
@@ -913,7 +954,7 @@ async function triggerRecompress() {
         showActionResult('正在触发重压缩...', 'info');
 
         const { errno, stdout, stderr } = await exec(
-            `echo "type=huge" > /sys/block/zram0/recompress 2>&1 && echo "OK" || echo "FAIL: $(cat /sys/block/zram0/recompress 2>&1)"`
+            `echo "type=huge" > /sys/block/${ZDEV}/recompress 2>&1 && echo "OK" || echo "FAIL: $(cat /sys/block/${ZDEV}/recompress 2>&1)"`
         );
 
         if (errno === 0 && stdout.includes('OK')) {
@@ -951,7 +992,7 @@ async function restartDaemon() {
 
         await exec(
             `chmod 0755 ${moduleDir}/psi_recomp 2>/dev/null; ` +
-            `setsid ${moduleDir}/psi_recomp ${moduleDir}/psi.log ${moduleDir}/psi.conf >/dev/null 2>&1 &`
+            `setsid ${moduleDir}/psi_recomp ${moduleDir}/psi.log ${moduleDir}/psi.conf ${ZDEV} >/dev/null 2>&1 &`
         );
 
         /* `cmd &` 的退出码恒为 0；等 PID 文件出现并确认进程存活 */

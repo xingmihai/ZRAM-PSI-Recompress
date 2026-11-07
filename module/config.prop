@@ -8,6 +8,10 @@ ZRAM_ALGO=lz4kd
 # 8589934592(8G) 12884901888(12G) 17179869184(16G) 25769803776(24G)
 ZRAM_SIZE=8589934592
 
+# zram 设备名（默认 zram0；仅允许 zram + 1~3 位数字，非法值回退 zram0）
+# service.sh、psi_recomp 守护进程、WebUI 都以此为唯一来源
+ZRAM_DEV=zram0
+
 # 重压缩算法（WebUI 可改，改后即时生效并写回本文件）
 # 一级：优先尝试；二级：处理一级残留的页
 RECOMP_ALGO1=zstdn
@@ -27,3 +31,4 @@ RECOMP_ALGO2=zstdn_o
 #   LOG_MAX_LINES=600
 #   LOG_KEEP_LINES=300
 #   SKIP_LOG_EVERY=5
+#   （ZRAM_DEV 不在 psi.conf 里配置，见上方 ZRAM_DEV）

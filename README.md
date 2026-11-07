@@ -19,7 +19,7 @@
 
 1. **PSI 事件驱动** — `poll("/proc/pressure/memory")`，内存回收产生 stall 时内核主动唤醒；空闲时进程完全阻塞，零唤醒零 CPU
 2. **裁决仍读 mm_stat** — PSI 只报 stall 时间，不报 huge 页数，唤醒后读第 8 字段决定压不压
-3. **自适应滞回** — 刚压完 90 分钟内，阈值 = 上次残留 + 8000 页（而非固定值），避开残留硬骨头
+3. **自适应滞回** — 阈值 = 上次压缩后的残留 + 8000 页（而非固定值），一直生效到下次压缩，避开残留硬骨头；huge 超过 `THRESH_NORMAL×1.5` 且距上次压缩 ≥ `HYSTERESIS_SEC` 时强制压一次作为兜底
 4. **限流** — 两次检查最小间隔 60 秒，防 PSI 风暴；被限流的唤醒会**延后**到间隔期满再检查，不再丢弃
 5. **定时兜底** — PSI 不可用（open/write/poll 失败）自动降级为 1800 秒轮询，功能不丢失；运行中途降级的会每 10 分钟自动重试武装 PSI
 6. **运行时配置** — 支持 `psi.conf` 配置文件，无需重新编译即可调整所有参数
@@ -55,10 +55,9 @@ LOG_KEEP_LINES=300
 
 # skip 日志降频
 SKIP_LOG_EVERY=5
-
-# zram 设备名（默认 zram0）
-ZRAM_DEV=zram0
 ```
+
+> zram 设备名 `ZRAM_DEV` 不在 `psi.conf` 里，而是写在 `config.prop`（默认 `zram0`，仅允许 `zram` + 1~3 位数字，非法值回退 `zram0`）。`service.sh`、守护进程（第 3 个命令行参数）和 WebUI 都以它为唯一来源。
 
 修改后重启模块生效。
 
@@ -116,10 +115,21 @@ v1.2.0 起支持 KernelSU 模块 WebUI，可在 KernelSU 管理器中直接：
 - 需要内核开启 `CONFIG_PSI`（`/proc/pressure/memory` 存在即可）
 - 若缺失自动降级为定时轮询，不会失效
 - `service.sh` 内含纯 shell 兜底循环，helper 缺失/启动失败时接管
-- 守护进程自动设置 `oom_score_adj=-500` 和 `nice=10`，降低被系统杀掉和抢占前台 CPU 的概率
+- 守护进程自动设置 `oom_score_adj=-800` 和 `nice=10`，降低被系统杀掉和抢占前台 CPU 的概率。守护只占几 MB 且内存有界，而它恰恰在内存吃紧时才工作（实测出现过 `recompress FAILED: Out of memory`），被 LMK 优先杀掉会让重压缩在最需要的时候失效，所以保护级别宜高不宜低
 - v1.2.0 起支持 `psi.conf` 运行时配置，无需重新编译即可调参
 
 ## 更新日志
+
+### v1.3.6（第二轮 review 修复）
+
+1. **PSI 降级重试间隔**：降级时把单次睡眠钳制到 ≤`PSI_RETRY_SEC`(600s)，重试真正每 10 分钟一次（原来实际 30 分钟）；定时检查点仍按 `IDLE_TIMEOUT_MS`
+2. **开机 PSI 未就绪**：去掉 `psi_ever` 门槛，启动时首次 arm 失败也会定期重试，恢复后日志出现 `PSI re-armed`
+3. **单实例**：`service.sh` 不再 `rm -f` PID 文件（会让旧进程的 flock 失效）；已有存活守护时直接跳过启动；PID 一律用 `/proc/<pid>/cmdline` 确认是 `psi_recomp` 才认/才杀，避免 PID 被复用后误杀无关进程
+4. **ZRAM_DEV 全打通**（方案 A）：唯一来源 `config.prop`；`service.sh`（初始化与 shell 兜底）、守护进程（第 3 个参数）、WebUI（22 处 sysfs/dev 路径）统一使用；非法值回退 `zram0`；不再从 `psi.conf` 读取
+5. **WebUI 日志回退解析**：改取最近一条 `stats:`/`exit:` 行，兼容新旧格式，新格式取真实 `mem_saved=… MiB`，旧格式退回 `total_saved/256`
+6. **滞回去掉时间窗**：阈值 = 上次残留 + `HYST_MARGIN`，一直生效到下次压缩（基准每次压缩后重置，不累加）；`HYSTERESIS_SEC` 改为「绝对上限兜底」的最小间隔；强制触发的日志标记为 `(cap)`
+7. **`oom_score_adj` 恢复 -800**，理由见上文
+8. **小项**：抢锁时 inode 不一致分支补 500ms 退避（10 秒等待才真正生效）；`versionCode` 手动递增为 10306
 
 ### v1.3.5（代码审查修复）
 

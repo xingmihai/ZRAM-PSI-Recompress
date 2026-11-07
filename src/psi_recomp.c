@@ -18,7 +18,22 @@
  *   6. 支持运行时配置文件：/data/adb/modules/ZRAM-PSI-Recompress/psi.conf
  *      可在不重新编译的情况下调整所有阈值参数。
  *
- * 用法: psi_recomp <logpath> [configpath]
+ * 用法: psi_recomp <logpath> [configpath] [zram_dev]
+ *   zram_dev 缺省/非法时回退 zram0；唯一来源是 module/config.prop 的 ZRAM_DEV，
+ *   由 service.sh / WebUI 读取校验后以第 3 个参数传入。
+ *
+ * v1.3.6 变更（第二轮 review 修复）：
+ *   - PSI 降级后的重试间隔钳制为 ≤PSI_RETRY_SEC：原先降级分支睡满
+ *     IDLE_TIMEOUT_MS(1800s)，重试条件要 30 分钟才求值一次。定时检查点
+ *     仍按 IDLE_TIMEOUT_MS 走，提前醒来只为重试 PSI。
+ *   - 去掉 psi_ever 门槛：开机时 PSI 未就绪（首次 arm 失败）也会定期重试。
+ *   - ZRAM_DEV 改由第 3 个命令行参数传入（来源 config.prop），不再读 psi.conf，
+ *     与 service.sh / WebUI 统一为单一来源。
+ *   - 滞回去掉 HYSTERESIS_SEC 时间窗：门槛 = 上次压缩残留 + HYST_MARGIN，
+ *     一直生效到下次压缩。HYSTERESIS_SEC 改为「绝对上限兜底」的最小间隔：
+ *     huge > THRESH_NORMAL×1.5 且距上次压缩 ≥ HYSTERESIS_SEC 时无视滞回强制压一次。
+ *   - oom_score_adj 恢复 -800。
+ *   - 抢锁时「inode 不一致」分支补 500ms 退避，LOCK_WAIT_TRIES 才真正对应 10 秒。
  *
  * v1.3.5 变更（代码审查修复）：
  *   - 计时改用 CLOCK_BOOTTIME：原先用 time()（墙钟），改系统时间/NTP 校时
@@ -218,8 +233,9 @@ static int acquire_instance_lock(void)
                 }
                 return 0;
             }
-            /* inode 不一致：锁到了已被删除的旧文件，重开 */
+            /* inode 不一致：锁到了已被删除的旧文件，退避后重开 */
             close(fd);
+            sleep_ms(500);
             continue;
         }
         close(fd);
@@ -283,7 +299,7 @@ static void protect_from_oom(void)
 {
     int fd = open("/proc/self/oom_score_adj", O_WRONLY | O_CLOEXEC);
     if (fd >= 0) {
-        ssize_t w = write(fd, "-500\n", 5);
+        ssize_t w = write(fd, "-800\n", 5);
         (void)w;
         close(fd);
     }
@@ -400,12 +416,12 @@ static int psi_trigger_valid(const char *s)
     return 1;
 }
 
-/* zram 设备名：zram + 1~4 位数字 */
+/* zram 设备名：zram + 1~3 位数字（与 service.sh / WebUI 的校验一致） */
 static int zram_dev_valid(const char *s)
 {
     if (strncmp(s, "zram", 4) != 0) return 0;
     size_t n = strlen(s + 4);
-    if (n < 1 || n > 4) return 0;
+    if (n < 1 || n > 3) return 0;
     for (const char *p = s + 4; *p; p++)
         if (*p < '0' || *p > '9') return 0;
     return 1;
@@ -459,12 +475,6 @@ static void load_config(const char *path)
                 snprintf(g_psi_trigger, sizeof(g_psi_trigger), "%s", val);
             else
                 cfg_warn("[PSI_TRIGGER 非法，沿用 \"%s\"] ", g_psi_trigger);
-        }
-        else if (!strcmp(key, "ZRAM_DEV")) {
-            if (zram_dev_valid(val))
-                snprintf(g_zram_dev, sizeof(g_zram_dev), "%s", val);
-            else
-                cfg_warn("[ZRAM_DEV 非法，沿用 %s] ", g_zram_dev);
         }
     }
     fclose(f);
@@ -576,9 +586,18 @@ int main(int argc, char **argv)
 {
     const char *logpath = (argc > 1) ? argv[1] : "/dev/null";
     const char *configpath = (argc > 2) ? argv[2] : NULL;
+    const char *zdev_arg   = (argc > 3) ? argv[3] : NULL;
 
     /* 先加载配置文件（如果有的话） */
-    if (configpath) load_config(configpath);
+    if (configpath && *configpath) load_config(configpath);
+
+    /* zram 设备名：唯一来源 config.prop，经第 3 个参数传入；非法值回退 zram0 */
+    if (zdev_arg && *zdev_arg) {
+        if (zram_dev_valid(zdev_arg))
+            snprintf(g_zram_dev, sizeof(g_zram_dev), "%s", zdev_arg);
+        else
+            cfg_warn("[zram_dev 参数非法，回退 %s] ", g_zram_dev);
+    }
 
     snprintf(g_mm_stat_path, sizeof(g_mm_stat_path), "/sys/block/%s/mm_stat", g_zram_dev);
     snprintf(g_recomp_path,  sizeof(g_recomp_path),  "/sys/block/%s/recompress", g_zram_dev);
@@ -636,18 +655,20 @@ int main(int argc, char **argv)
 
     /* 先探测一次：PSI 是否可用，不可用则全程走定时 */
     int psi_ok = 0;
-    int psi_ever = 0;           /* 启动时探测成功过：降级后才值得重试 */
-    int psi_warned = 0;         /* 降级期间只记一次失败日志 */
+    int psi_warned = 0;         /* 降级期间只记一次失败日志，重试失败不刷屏 */
+    long idle_start = -1;       /* 降级轮询：本轮定时检查的起点（<0 表示未开始） */
     long psi_retry_at = mono_sec();
     {
         int probe = psi_arm();
         if (probe >= 0) {
             psi_ok = 1;
-            psi_ever = 1;
             plog("PSI armed: %s", g_psi_trigger);
             close(probe);
         } else {
-            plog("PSI unavailable (%s) -> fallback to timer", strerror(errno));
+            /* 开机时 PSI 可能尚未就绪：先降级，后面每 PSI_RETRY_SEC 重试 */
+            plog("PSI unavailable (%s) -> fallback to timer (retry every %ds)",
+                 strerror(errno), PSI_RETRY_SEC);
+            psi_warned = 1;
         }
     }
 
@@ -655,8 +676,8 @@ int main(int argc, char **argv)
         int fired = 0;
         int psi = -1;
 
-        /* 降级后定期重试，避免一次偶发失败就永久丢失事件驱动 */
-        if (!psi_ok && psi_ever && (mono_sec() - psi_retry_at) >= PSI_RETRY_SEC) {
+        /* 降级后定期重试（含启动时即失败的情况），避免永久丢失事件驱动 */
+        if (!psi_ok && (mono_sec() - psi_retry_at) >= PSI_RETRY_SEC) {
             psi_ok = 1;
             psi_retry_at = mono_sec();
         }
@@ -710,8 +731,22 @@ int main(int argc, char **argv)
         }
 
         if (psi >= 0) { close(psi); psi = -1; }
-        if (!psi_ok && !fired) sleep_full(g_idle_timeout_ms / 1000);
-        if (!g_running) break;
+        if (!psi_ok && !fired) {
+            /*
+             * 降级轮询：把单次睡眠钳制到 PSI_RETRY_SEC，保证每 ≤600s 回到循环顶
+             * 求值一次重试条件；否则默认要睡满 IDLE_TIMEOUT_MS(1800s) 才有机会重试。
+             * 定时检查点仍按 IDLE_TIMEOUT_MS 走：未到点就直接回循环顶，不做检查。
+             */
+            long idle_s = g_idle_timeout_ms / 1000;
+            if (idle_start < 0) idle_start = mono_sec();
+            long remain = idle_s - (mono_sec() - idle_start);   /* 距定时检查点 */
+            if (remain < 1) remain = 1;
+            long chunk = remain > PSI_RETRY_SEC ? PSI_RETRY_SEC : remain;
+            sleep_full(chunk);
+            if (!g_running) break;
+            if ((mono_sec() - idle_start) < idle_s) continue;
+        }
+        idle_start = -1;
 
         long now = mono_sec();
         /*
@@ -744,17 +779,33 @@ int main(int argc, char **argv)
         /* 每次检查后立即落盘，WebUI 读到的是实时值 */
         write_stats_file(n_check, n_psi, n_throttled, n_comp, peak, huge, last_comp);
 
-        /* 滞回：门槛 = 上次残留 + margin */
-        int in_hyst = (last_comp >= 0) && ((now - last_comp) < g_hysteresis_sec);
+        /*
+         * 滞回：门槛 = 上次压缩后的残留 + margin，一直生效到下次压缩。
+         * 基准每次压缩后重置为新的残留，不会累加，没有门槛螺旋。
+         * （原先 5400s 后解除滞回，门槛回落到 40000 而地板已 ~47000，
+         *   必然触发且只剩压不动的残留，实测白干两次。）
+         *
+         * 绝对上限兜底：huge > THRESH_NORMAL×1.5 且距上次压缩 ≥ HYSTERESIS_SEC
+         * 时无视滞回强制压一次，防止极端情况下永不触发；
+         * 最小间隔防止地板本身已高于上限时每次检查都空压。
+         */
+        int in_hyst = (last_comp >= 0) && (last_residual > 0);
+        int forced = 0;
         long th = g_thresh_normal;
-        if (in_hyst && last_residual > 0) {
+        if (in_hyst) {
             long cand = last_residual + g_hyst_margin;
             if (cand > th) th = cand;
+            if (huge > g_thresh_normal + g_thresh_normal / 2 &&
+                (now - last_comp) >= g_hysteresis_sec) {
+                th = g_thresh_normal;
+                forced = 1;
+            }
         }
+        const char *tag = forced ? "(cap)" : (in_hyst ? "(hyst)" : "");
 
         if (huge > th) {
             plog("evt=%s huge=%ld > %ld%s -> recompress",
-                 fired ? "psi" : "idle", huge, th, in_hyst ? "(hyst)" : "");
+                 fired ? "psi" : "idle", huge, th, tag);
             skip_streak = 0;
             if (do_recompress() == 0) {
                 long after = -1;
@@ -793,9 +844,11 @@ int main(int argc, char **argv)
             }
         } else {
             skip_streak++;
-            if (skip_streak % (unsigned long)g_skip_log_every == 1) {
+            /* skip_streak 先自增，最小为 1：(x-1)%N==0 命中第 1、N+1、2N+1…次；
+             * N=1 恒真（每次都写），N≥2 与原 x%N==1 完全一致。 */
+            if ((skip_streak - 1) % (unsigned long)g_skip_log_every == 0) {
                 plog("evt=%s huge=%ld <= %ld%s skip x%lu (peak=%ld)",
-                     fired ? "psi" : "idle", huge, th, in_hyst ? "(hyst)" : "",
+                     fired ? "psi" : "idle", huge, th, tag,
                      skip_streak, peak);
             }
         }
