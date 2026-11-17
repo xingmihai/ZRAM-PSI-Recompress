@@ -22,6 +22,19 @@
  *   zram_dev 缺省/非法时回退 zram0；唯一来源是 module/config.prop 的 ZRAM_DEV，
  *   由 service.sh / WebUI 读取校验后以第 3 个参数传入。
  *
+ * v1.3.7 变更（recompress OOM 容错）：
+ *   - 重压缩可选分批（max_pages=N），默认关闭：内核该参数只限制「尝试
+ *     重压缩的页数」，并不限制全 slot 扫描，12 GiB 设备每批要遍历
+ *     3,145,728 个 slot，多批会成倍放大 CPU 开销。启动时做一次零副作用
+ *     探测并写入日志，需要时由 RECOMP_BATCH_PAGES 显式开启。开启后一次
+ *     检查内连续多批，用最终 huge 作为滞回基准，语义与全量一致。
+ *   - ENOMEM 不再当作「整次失败」：内核遇分配失败会 break，但 break 前已
+ *     压成功的页是算数的。改为无论成败都读回 mm_stat，按真实降幅统计。
+ *   - ENOMEM 时记录 MemAvailable / mem_used_total / huge，触发 zsmalloc
+ *     compact（WO 属性，只能 echo 1）整理碎片，短退避后重试一次。
+ *   - WebUI 重建 zram 成功后重启守护：新设备是空的，旧进程内存里的滞回
+ *     基准 / peak / 累计节省都属于旧设备，不重启会污染统计与触发判据。
+ *
  * v1.3.6 变更（第二轮 review 修复）：
  *   - PSI 降级后的重试间隔钳制为 ≤PSI_RETRY_SEC：原先降级分支睡满
  *     IDLE_TIMEOUT_MS(1800s)，重试条件要 30 分钟才求值一次。定时检查点
@@ -132,6 +145,9 @@ static long g_hyst_margin     = 8000;           /* 残留之上再新增这么�
 static long g_log_max_lines   = 600;            /* 超过此行数触发轮转 */
 static long g_log_keep_lines  = 300;            /* 轮转后保留的行数 */
 static long g_skip_log_every  = 5;              /* 连续 skip 时每 N 次记一行 */
+static long g_recomp_batch_pages = 0;           /* 单批 max_pages；0 = 不分批（默认） */
+static long g_recomp_batch_max   = 2;           /* 一次检查内最多连续几批 */
+static int  g_max_pages_state   = -1;           /* -1 未探测 / 0 不支持 / 1 支持 */
 static char g_psi_trigger[64] = "some 15000 1000000";  /* 1s 窗口内 stall > 15ms 触发 */
 static char g_zram_dev[16]    = "zram0";        /* zram 设备名 */
 
@@ -151,6 +167,7 @@ static unsigned long long g_total_saved_bytes = 0; /* 累计 mem_used_total 降�
 
 static char g_mm_stat_path[64];
 static char g_recomp_path[64];
+static char g_compact_path[64];
 static char g_cfg_warn[512];             /* 配置解析告警，日志打开后统一输出 */
 
 static void on_sig(int s) { (void)s; g_running = 0; }
@@ -470,6 +487,10 @@ static void load_config(const char *path)
             set_long(key, val, &g_log_keep_lines);
         else if (!strcmp(key, "SKIP_LOG_EVERY"))
             set_long(key, val, &g_skip_log_every);
+        else if (!strcmp(key, "RECOMP_BATCH_PAGES"))
+            set_long(key, val, &g_recomp_batch_pages);
+        else if (!strcmp(key, "RECOMP_BATCH_MAX"))
+            set_long(key, val, &g_recomp_batch_max);
         else if (!strcmp(key, "PSI_TRIGGER")) {
             if (strlen(val) < sizeof(g_psi_trigger) && psi_trigger_valid(val))
                 snprintf(g_psi_trigger, sizeof(g_psi_trigger), "%s", val);
@@ -506,6 +527,11 @@ static void clamp_config(void)
     if (g_log_keep_lines >= g_log_max_lines) g_log_keep_lines = g_log_max_lines / 2;
     if (g_skip_log_every < 1)         g_skip_log_every = 1;
     if (g_skip_log_every > 100)       g_skip_log_every = 100;
+    /* 分批参数：0 表示关闭；上限防止单次写入过大或循环过久 */
+    if (g_recomp_batch_pages < 0)     g_recomp_batch_pages = 0;
+    if (g_recomp_batch_pages > 200000) g_recomp_batch_pages = 200000;
+    if (g_recomp_batch_max < 1)       g_recomp_batch_max = 1;
+    if (g_recomp_batch_max > 4)       g_recomp_batch_max = 4;
 }
 
 /* ---------------- mm_stat 读取 ---------------- */
@@ -555,16 +581,156 @@ static const char *mm_err_str(int rc)
     return rc == -2 ? "mm_stat 字段不足或无法解析" : strerror(errno);
 }
 
-static int do_recompress(void)
+/* 通用 sysfs 只写写入；返回 0 或 -1（errno 有效） */
+static int sysfs_write(const char *path, const char *cmd)
 {
-    int fd = open(g_recomp_path, O_WRONLY | O_CLOEXEC);
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
     if (fd < 0) return -1;
-    const char *cmd = "type=huge";
     ssize_t w = write(fd, cmd, strlen(cmd));
-    int err = errno;
+    int e = errno;
     close(fd);
-    if (w != (ssize_t)strlen(cmd)) { errno = err; return -1; }
+    if (w != (ssize_t)strlen(cmd)) { errno = e; return -1; }
     return 0;
+}
+
+static long read_mem_available_kb(void)
+{
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return -1;
+    char buf[256];
+    long kb = -1;
+    while (fgets(buf, sizeof(buf), f))
+        if (sscanf(buf, "MemAvailable: %ld kB", &kb) == 1) break;
+    fclose(f);
+    return kb;
+}
+
+/*
+ * 启动时零副作用探测 max_pages 能力：max_pages=1 最多实际处理 1 页。
+ * 不直接默认开启分批，是因为每批都会遍历全部 slot（见文件头说明）。
+ * 探测结果仅用于日志与「用户显式开启分批」时走正确分支。
+ */
+static void probe_max_pages(void)
+{
+    if (sysfs_write(g_recomp_path, "type=huge max_pages=1") == 0) {
+        g_max_pages_state = 1;
+        plog("max_pages supported: yes (enable batching via RECOMP_BATCH_PAGES>0)");
+        return;
+    }
+    int e = errno;
+    if (e == EINVAL) {
+        g_max_pages_state = 0;
+        plog("max_pages supported: no (EINVAL) -> full pass only");
+    } else {
+        g_max_pages_state = -1;
+        plog("max_pages probe inconclusive (%s) -> detect on first use", strerror(e));
+    }
+}
+
+/* 按当前能力探测结果生成 recompress 命令 */
+static void build_recomp_cmd(char *buf, size_t n)
+{
+    if (g_recomp_batch_pages > 0 && g_max_pages_state != 0)
+        snprintf(buf, n, "type=huge max_pages=%ld", g_recomp_batch_pages);
+    else
+        snprintf(buf, n, "type=huge");
+}
+
+/*
+ * 单批重压缩。
+ *   - 首次写入顺带探测 max_pages 能力：不认识该参数的内核会返回 EINVAL，
+ *     此时整串被拒（一页都没压），标记不支持并立即回退为全量一次。
+ *   - ENOMEM：内核 zs_malloc 带 __GFP_KSWAPD_RECLAIM，分不到 zspage 就
+ *     bail out 并 break，旧对象原样保留、不丢数据。这里记录现场、触发
+ *     zsmalloc compact 整理碎片，短退避后重试一次。
+ * 返回 0 表示 write 成功；-1 表示失败（errno 有效）。
+ */
+static int recompress_one_batch(int *oom_seen)
+{
+    char cmd[96];
+    build_recomp_cmd(cmd, sizeof(cmd));
+    int batched = (strstr(cmd, "max_pages=") != NULL);
+
+    if (sysfs_write(g_recomp_path, cmd) == 0) {
+        if (batched && g_max_pages_state < 0) {
+            g_max_pages_state = 1;
+            plog("max_pages supported: yes (batch=%ld pages, max_batches=%ld)",
+                 g_recomp_batch_pages, g_recomp_batch_max);
+        }
+        return 0;
+    }
+    int e = errno;
+
+    if (batched && g_max_pages_state < 0 && e == EINVAL) {
+        g_max_pages_state = 0;
+        plog("max_pages supported: no (EINVAL) -> full pass");
+        build_recomp_cmd(cmd, sizeof(cmd));
+        if (sysfs_write(g_recomp_path, cmd) == 0) return 0;
+        e = errno;
+    }
+
+    if (e == ENOMEM) {
+        *oom_seen = 1;
+        long avail = read_mem_available_kb();
+        long h2 = -1;
+        long long mu = -1;
+        (void)read_mm_stat(&h2, &mu);
+        plog("  ENOMEM: MemAvailable=%ld MiB, mem_used_total=%.1f MiB, huge=%ld",
+             avail >= 0 ? avail / 1024 : -1,
+             mu >= 0 ? (double)mu / 1048576.0 : -1.0, h2);
+
+        if (sysfs_write(g_compact_path, "1") == 0)
+            plog("  compact issued -> retry once after 300ms");
+        else
+            plog("  compact unavailable (%s) -> retry after 300ms", strerror(errno));
+        sleep_ms(300);
+        build_recomp_cmd(cmd, sizeof(cmd));
+        if (sysfs_write(g_recomp_path, cmd) == 0) {
+            plog("  retry after compact: ok");
+            return 0;
+        }
+        e = errno;
+        plog("  retry after compact failed: %s", strerror(e));
+    } else {
+        plog("  recompress sysfs error: %s", strerror(e));
+    }
+
+    errno = e;
+    return -1;
+}
+
+/*
+ * 执行一轮重压缩（可多批）。
+ * huge_io / mem_io 传入检查时的值，回写为最终值，供调用方统计与作为滞回基准。
+ * 关键：即使某批返回 ENOMEM，内核 break 前已压成功的页仍有效，所以无论
+ * 成败都要读回 mm_stat，绝不写「整次失败」。
+ */
+static void recompress_round(long *huge_io, long long *mem_io,
+                             int *oom_seen, int *ok_batches)
+{
+    *oom_seen = 0;
+    *ok_batches = 0;
+    long prev = *huge_io;
+
+    long nbatch = (g_recomp_batch_pages > 0 && g_max_pages_state != 0)
+                  ? g_recomp_batch_max : 1;
+
+    for (long b = 0; b < nbatch && g_running; b++) {
+        int rc1 = recompress_one_batch(oom_seen);
+        if (rc1 == 0) (*ok_batches)++;
+
+        long after = -1;
+        long long ma = -1;
+        if (read_mm_stat(&after, &ma) != 0) break;
+        *huge_io = after;
+        if (ma >= 0) *mem_io = ma;
+
+        long progress = prev - after;
+        if (rc1 != 0 || progress < 64) break;   /* 失败或没进展就停，别空耗 */
+        prev = after;
+        /* 全量模式一批即止（每次都从头扫，重复无意义） */
+        if (g_max_pages_state == 0 || g_recomp_batch_pages <= 0) break;
+    }
 }
 
 /* 用全新 fd 武装 PSI 触发器；失败返回 -1（errno 有效） */
@@ -601,6 +767,7 @@ int main(int argc, char **argv)
 
     snprintf(g_mm_stat_path, sizeof(g_mm_stat_path), "/sys/block/%s/mm_stat", g_zram_dev);
     snprintf(g_recomp_path,  sizeof(g_recomp_path),  "/sys/block/%s/recompress", g_zram_dev);
+    snprintf(g_compact_path, sizeof(g_compact_path), "/sys/block/%s/compact", g_zram_dev);
 
     g_logpath = logpath;
     g_log = fopen(logpath, "a");
@@ -645,6 +812,10 @@ int main(int argc, char **argv)
          (int)getpid(), g_zram_dev, g_thresh_normal, g_hysteresis_sec,
          g_hyst_margin, g_min_gap_sec);
     if (g_cfg_warn[0]) plog("config warning: %s", g_cfg_warn);
+    probe_max_pages();
+    plog("recompress batch: %s (pages=%ld max_batches=%ld)",
+         g_recomp_batch_pages > 0 ? "enabled" : "disabled (full pass)",
+         g_recomp_batch_pages, g_recomp_batch_max);
 
     long last_check = -1;       /* 单调时间；<0 表示尚未检查 */
     long last_comp  = -1;       /* 单调时间；<0 表示从未压缩 */
@@ -807,31 +978,37 @@ int main(int argc, char **argv)
             plog("evt=%s huge=%ld > %ld%s -> recompress",
                  fired ? "psi" : "idle", huge, th, tag);
             skip_streak = 0;
-            if (do_recompress() == 0) {
-                long after = -1;
-                long long mem_after = -1;
-                int rc2 = read_mm_stat(&after, &mem_after);
+            long after = huge;
+            long long mem_after = mem_before;
+            int oom = 0, batches = 0;
+            recompress_round(&after, &mem_after, &oom, &batches);
+            if (!g_running) break;   /* 退出途中别记一次假的 FAILED */
 
+            long saved = huge - after;
+            if (saved < 0) saved = 0;
+
+            /*
+             * 以最终 mm_stat 为准：内核遇 ENOMEM 会 break，但 break 前已压
+             * 成功的页是算数的，旧实现写「整次 FAILED」且不统计，少报收益。
+             * 只有「一批都没成功且零降幅」才算真失败，此时不推进滞回基准。
+             */
+            if (batches == 0 && saved == 0) {
+                plog("  recompress FAILED: no progress (oom=%s)", oom ? "yes" : "no");
+            } else {
                 last_comp = mono_sec();
                 n_comp++;
-
-                if (rc2 == 0) {
-                    long saved = huge - after;
-                    if (saved > 0) g_total_saved_pages += (unsigned long)saved;
-                    if (mem_before >= 0 && mem_after >= 0 && mem_before > mem_after)
-                        g_total_saved_bytes += (unsigned long long)(mem_before - mem_after);
-                    plog("  done: %ld -> %ld (%+ld pages, %.1f%%), mem_used %.1f -> %.1f MiB",
-                         huge, after, -saved,
-                         huge > 0 ? (double)saved / huge * 100 : 0.0,
-                         mem_before >= 0 ? (double)mem_before / 1048576.0 : -1.0,
-                         mem_after  >= 0 ? (double)mem_after  / 1048576.0 : -1.0);
-                    if (after > 0) last_residual = after;
-                    write_stats_file(n_check, n_psi, n_throttled, n_comp, peak, after, last_comp);
-                } else {
-                    /* 压缩已执行，但无法得知残留：不统计节省，滞回沿用旧残留 */
-                    plog("  done, but re-read mm_stat failed: %s", mm_err_str(rc2));
-                    write_stats_file(n_check, n_psi, n_throttled, n_comp, peak, huge, last_comp);
-                }
+                if (saved > 0) g_total_saved_pages += (unsigned long)saved;
+                if (mem_before >= 0 && mem_after >= 0 && mem_before > mem_after)
+                    g_total_saved_bytes += (unsigned long long)(mem_before - mem_after);
+                plog("  done: %ld -> %ld (%+ld pages, %.1f%%), mem_used %.1f -> %.1f MiB%s%s",
+                     huge, after, -saved,
+                     huge > 0 ? (double)saved / huge * 100 : 0.0,
+                     mem_before >= 0 ? (double)mem_before / 1048576.0 : -1.0,
+                     mem_after  >= 0 ? (double)mem_after  / 1048576.0 : -1.0,
+                     oom ? " [partial: ENOMEM]" : "",
+                     batches > 1 ? " [batched]" : "");
+                if (after > 0) last_residual = after;
+                write_stats_file(n_check, n_psi, n_throttled, n_comp, peak, after, last_comp);
 
                 /* 每 10 次压缩输出一次累计统计 */
                 if (n_comp % 10 == 0) {
@@ -839,8 +1016,6 @@ int main(int argc, char **argv)
                          n_comp, g_total_saved_pages,
                          (double)g_total_saved_bytes / 1048576.0, peak);
                 }
-            } else {
-                plog("  recompress FAILED: %s", strerror(errno));
             }
         } else {
             skip_streak++;

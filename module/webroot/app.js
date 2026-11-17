@@ -17,7 +17,7 @@ let autoRefreshTimer = null;
  * 由 app.js 实时读取、永远显示最新 —— 无法据此判断页面是否新鲜。
  * 页面上显示此标记，与仓库当前值比对即可确认。
  */
-const WEBUI_BUILD = 12;
+const WEBUI_BUILD = 13;
 
 /*
  * 输入校验（v1.3.5）：
@@ -504,10 +504,17 @@ async function applyZramDevice() {
             toast(`部分步骤失败：${failed.join(', ')}，详见 zram_apply.log`, -1);
         } else if (!recompOk) {
             toast(`已重建，但重压缩算法未生效（recomp_algorithm 为空）——重压缩将无效`, -1);
-        } else if (tolerant.length) {
-            toast(`已重建：${algo} / ${sizeGB} GB（${tolerant.join(', ')} 失败，不影响）`);
         } else {
-            toast(`已重建：${algo} / ${sizeGB} GB`);
+            const ext = tolerant.length ? `（${tolerant.join(', ')} 失败，不影响）` : '';
+            toast(`已重建：${algo} / ${sizeGB} GB${ext}，正在重启守护...`);
+            /*
+             * 重建会清空 zram，但守护进程内存里仍带着旧设备的 last_residual /
+             * peak / 累计节省。不重启会让滞回门槛凭空抬高（例如残留 48640 时
+             * 门槛变 56640，而新设备是空的），峰值与统计也会混进旧设备。
+             * 重启后这些状态归零，从新设备干净开始。
+             */
+            await restartDaemon();
+            return;   /* restartDaemon 内部已刷新状态与统计 */
         }
         await refreshStatus();
     } catch (e) {

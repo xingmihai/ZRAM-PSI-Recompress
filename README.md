@@ -120,6 +120,32 @@ v1.2.0 起支持 KernelSU 模块 WebUI，可在 KernelSU 管理器中直接：
 
 ## 更新日志
 
+### v1.3.7（recompress OOM 容错）
+
+- **可选分批，默认关闭**：`RECOMP_BATCH_PAGES>0` 时写入
+  `type=huge max_pages=N`（默认一次最多 2 批）。启动时零副作用探测能力
+  并在 `psi.log` 写明 `max_pages supported: yes/no`。
+  默认关闭的原因：内核该参数只限制「尝试重压缩的页数」，并不限制
+  `for(index=0; index<nr_pages)` 的全 slot 扫描——12 GiB 设备每批要遍历
+  3,145,728 个 slot，多批会成倍放大 CPU 开销。**主修复不依赖分批**：
+  ENOMEM 诊断、compact 整理、重试与真实降幅统计在默认配置下全部生效。
+- **ENOMEM 不再算「整次失败」**：内核 `zs_malloc` 分配不到 zspage 时会
+  bail out 并 `break`，旧对象原样保留、不丢数据，但 break 前已压成功的页
+  是算数的。改为无论成败都读回 `mm_stat`，按真实降幅统计，日志追加
+  `[partial: ENOMEM]` 标记。
+- **ENOMEM 现场诊断 + 碎片整理**：记录 `MemAvailable`、`mem_used_total`、
+  当前 huge，触发 `echo 1 > compact`（WO 属性，只能写）整理 zsmalloc 碎片，
+  300ms 后重试一次。
+- **重建 zram 后自动重启守护**：避免旧设备的滞回基准 / 峰值 / 累计节省
+  污染新设备（新设备是空的）。
+- 新增 `psi.conf` 项：`RECOMP_BATCH_PAGES`（默认 0，关闭分批）、
+  `RECOMP_BATCH_MAX`（默认 2，上限 4）。二者均有钳制，不进 WebUI 滑块
+  （属底层容错参数）。
+
+> 相关命令：`echo "type=huge max_pages=20000" > /sys/block/zram0/recompress`
+> 与 `echo 1 > /sys/block/zram0/compact`。前者 rc=0 表示内核支持分批；
+> 后者是只写属性，用 `cat` 探测必然失败，必须用 `echo 1 >`。
+
 ### v1.3.6（第二轮 review 修复）
 
 1. **PSI 降级重试间隔**：降级时把单次睡眠钳制到 ≤`PSI_RETRY_SEC`(600s)，重试真正每 10 分钟一次（原来实际 30 分钟）；定时检查点仍按 `IDLE_TIMEOUT_MS`
